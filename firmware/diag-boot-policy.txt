@@ -1,0 +1,8 @@
+Profile: uboot-diag. Built-in command: r5sboot, selected by compiled default environment.
+Command entry immediately sets up SYS GPIO4_D2 active high, then stays in its diagnostic loop.
+Initial OFF 1000 ms. Repeat ON 750 ms, OFF 250 ms, ON 750 ms, OFF 2250 ms.
+Timings are nominal U-Boot mdelay timings, not yet measured on this physical board.
+No EL2 check, payload lookup/read/hash, MMU/cache handoff, seL4, or Rust execution.
+FAT intentionally contains only boot.txt and manifest.json. loader.img is absent.
+No environment save, eMMC access in the command, network, USB, PCIe, installer or fallback.
+Earlier BootROM probing is outside this command's control. Hardware tested: false.

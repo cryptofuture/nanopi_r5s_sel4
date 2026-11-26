@@ -1,0 +1,41 @@
+#!/bin/bash
+set -eu
+cd "$(dirname "$0")/.."
+. scripts/env
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+rustc --edition 2024 --crate-type rlib --crate-name rtl8125 drivers/rtl8125/lib.rs -o "$work/librtl8125.rlib"
+R5S_PROJECT_ROOT=$PWD rustc --edition 2024 --test tests/lan1_bringup.rs --extern rtl8125="$work/librtl8125.rlib" -o "$work/bringup"
+"$work/bringup"
+R5S_PROJECT_ROOT=$PWD rustc --edition 2024 --test --cfg 'feature="lan2"' tests/lan1_bringup.rs --extern rtl8125="$work/librtl8125.rlib" -o "$work/bringup-lan2"
+"$work/bringup-lan2"
+rustc --edition 2021 --test tests/wan_fault2_diagnostics.rs -o "$work/watchdog"
+"$work/watchdog"
+
+rustc --edition 2024 --crate-type rlib --crate-name r5s_router_core router-core/src/lib.rs -o "$work/libr5s_router_core.rlib"
+R5S_PROJECT_ROOT=$PWD rustc --edition 2024 --test --cfg 'feature="lan-dhcp"' tests/lan1_bringup.rs \
+  --extern rtl8125="$work/librtl8125.rlib" --extern r5s_router_core="$work/libr5s_router_core.rlib" -o "$work/lan-service"
+"$work/lan-service"
+
+R5S_PROJECT_ROOT=$PWD rustc --edition 2024 --test --cfg 'feature="lan-dhcp"' --cfg 'feature="tx-self-test"' tests/lan1_bringup.rs \
+  --extern rtl8125="$work/librtl8125.rlib" --extern r5s_router_core="$work/libr5s_router_core.rlib" -o "$work/tx-self-test"
+"$work/tx-self-test"
+
+R5S_PROJECT_ROOT=$PWD rustc --edition 2024 --test --cfg 'feature="lan-dhcp"' --cfg 'feature="tx-diagnostic"' tests/lan1_bringup.rs \
+  --extern rtl8125="$work/librtl8125.rlib" --extern r5s_router_core="$work/libr5s_router_core.rlib" -o "$work/tx-diagnostic"
+"$work/tx-diagnostic"
+
+R5S_PROJECT_ROOT=$PWD rustc --edition 2024 --test --cfg 'feature="lan-dhcp"' --cfg 'feature="tx-diagnostic"' --cfg 'feature="tx-no-close"' tests/lan1_bringup.rs \
+  --extern rtl8125="$work/librtl8125.rlib" --extern r5s_router_core="$work/libr5s_router_core.rlib" -o "$work/tx-no-close"
+"$work/tx-no-close"
+
+for experiment in tx-check tally-rx-first; do
+    R5S_PROJECT_ROOT=$PWD rustc --edition 2024 --test --cfg 'feature="lan-dhcp"' --cfg 'feature="tx-diagnostic"' --cfg 'feature="tx-no-close"' --cfg "feature=\"$experiment\"" tests/lan1_bringup.rs \
+        --extern rtl8125="$work/librtl8125.rlib" --extern r5s_router_core="$work/libr5s_router_core.rlib" -o "$work/$experiment"
+    "$work/$experiment"
+done
+
+R5S_PROJECT_ROOT=$PWD rustc --edition 2024 --test --cfg 'feature="lan-dhcp"' --cfg 'feature="lan-port"' \
+  --cfg 'feature="tx-no-close"' tests/lan1_bringup.rs --extern rtl8125="$work/librtl8125.rlib" \
+  --extern r5s_router_core="$work/libr5s_router_core.rlib" -o "$work/lan-port"
+"$work/lan-port" pipelined_port_survives_link_flap_and_preserves_stalled_buffers

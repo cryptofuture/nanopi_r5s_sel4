@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+import hashlib,json,re,shutil,subprocess,sys
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1];BASE=ROOT/'out/preflight-fix';NEW=BASE/'gmac-dma-preflight-fixed';OLD=ROOT/'out/gmac-rawio/gmac-dma-preflight'
+sys.path.insert(0,str(ROOT/'scripts'))
+from policy import sha256
+from fdt_evidence import Fdt
+
+def main():
+ a=json.loads((BASE/'ARTIFACTS.json').read_text())
+ for p,h in a['preserved'].items():assert sha256(ROOT/p)==h,p
+ for p,h in json.loads((BASE/'source-hashes.json').read_text()).items():assert sha256(ROOT/p)==h,p
+ firmware={}
+ for name in ('idbloader.img','spl/u-boot-spl.bin','u-boot.dtb','u-boot-nodtb.bin','u-boot.itb'):
+  p=OLD/'build'/name;q=NEW/'build'/name;firmware[name]=dict(old=sha256(p),new=sha256(q),identical=sha256(p)==sha256(q))
+ assert all(firmware[name]['identical'] for name in ('idbloader.img','spl/u-boot-spl.bin','u-boot.dtb'))
+ assert sha256(OLD/'uboot.config')==sha256(NEW/'uboot.config')
+ compared={name:dict(old=sha256(OLD/name),new=sha256(NEW/name),identical=sha256(OLD/name)==sha256(NEW/name)) for name in ('driver.elf','heartbeat.elf','health.elf','loader.elf','sel4.elf','initialiser.elf','monitor.elf','loader.img','uboot.config')}
+ (BASE/'differential.json').write_text(json.dumps(dict(components=compared,firmware=firmware,working_link_supervisor_equals_failed=sha256(ROOT/'out/gmac-bringup/supervisor.elf')==sha256(OLD/'heartbeat.elf')),indent=2)+'\n')
+ logs=BASE/'logs/linked';logs.mkdir(exist_ok=True)
+ for elf in NEW.glob('*.elf'):
+  with (logs/(elf.name+'.layout.txt')).open('w') as out:subprocess.run(['readelf','-lSW',elf],stdout=out,check=True)
+ for name in ('driver','heartbeat'):
+  with (logs/(name+'.disassembly.txt')).open('w') as out:subprocess.run(['aarch64-none-elf-objdump','-d',NEW/(name+'.elf')],stdout=out,check=True)
+ with (logs/'fit-inventory.txt').open('w') as out:subprocess.run([NEW/'build/tools/dumpimage','-l',NEW/'build/u-boot.itb'],stdout=out,check=True)
+ stats=[]
+ for p in (BASE/'work/fixed-driver/target').rglob('*.su'):stats+=p.read_text().splitlines()
+ (logs/'c-stack-usage.txt').write_text('\n'.join(stats)+'\n')
+ fdt_path=ROOT/'evidence/gmac-captured-1e089e3a/inner/gmac-evidence/runtime-original.dtb';fdt=Fdt(fdt_path.read_bytes())
+ reserved=list(fdt.reservations)
+ for path in fdt.nodes:
+  if path.startswith('/reserved-memory/') and 'reg' in fdt.nodes[path]:reserved.extend((start,start+size) for start,size in fdt.regs(path))
+ for start,end in reserved:assert end<=0x20000000 or start>=0x40000000
+ layout=json.loads((BASE/'layout-report.json').read_text());layout['captured_reservations']=dict(source=str(fdt_path.relative_to(ROOT)),sha256=sha256(fdt_path),original_fdt_reservation_table=fdt.reservations,all_reserved_ranges=reserved,working_ram=[0x20000000,0x40000000],overlap=False)
+ (BASE/'layout-report.json').write_text(json.dumps(layout,indent=2)+'\n')
+ (BASE/'dma-map.json').write_text(json.dumps(dict(dma_enabled=False,bus_address=None,role='CPU-owned scratch, never descriptors or packet buffers',cpu_virtual=0x60000000,physical=0x24000000,size=0x40000,alignment=4096,cache_line=64,attributes='Normal-WB',owner='gmac',frames=64,device_aliases=False,kernel_alias='Normal-WB',device_visibility_proven=False),indent=2)+'\n')
+ (BASE/'capability-audit.json').write_text(json.dumps(dict(abi=2,words=40,pool_owner='gmac',vspace_slot=3,vspace_object='pud_gmac',tcb_vspace_object='pud_gmac',service_type='native VSpace root',asid='validated by pinned kernel invocation, live numeric ASID not captured',ipc_virtual=0xfffffff000,stack_virtual=[0xffffffc000,0xffffffe000],ipc_owner='actual Rust TLS IPC buffer initialized by sel4-microkit entrypoint',mmio='Device nGnRnE',ram='Normal-WB',sys_owner_after_monitor_release='heartbeat',pd_changes='no added PDs, priorities/budgets/stacks unchanged',smmu_enabled=False),indent=2)+'\n')
+ fields=['sequence','abi','profile','generation','phase','phase_started_ms','execution_ms','completed_pages','phy_sample_ms','link_state','speed_mbps','full_duplex','cache_passed','inactive_checked','first_reason','first_result','operation','arg_start_low','arg_end_low','first_phase','first_time_ms','first_progress','first_link','build_id_0','build_id_1','build_id_2','build_id_3','arg_start_high','arg_end_high','component','observed','expected','first_phase_started_ms','live_mac_version','live_phy_id','live_clock_hz','first_mac_version','first_phy_id','first_clock_hz','reserved']
+ (BASE/'status-abi.json').write_text(json.dumps(dict(version=2,atomic_width=32,bytes=160,driver_virtual=0x40002000,fields={str(i):name for i,name in enumerate(fields)},commit='odd/even sequence with release/acquire, reader bounded to two attempts',result='seL4 error only for CACHE_CALL; signed C return encoded u32 for LINK_INIT/LINK_POLL/INACTIVE; supervisor code for cooperative abort',supervisor_record_virtual=0x40001080,supervisor_record='reason committed last; independent first-effect record; profile/build/component/phase/progress/last execution/link/result retained',persistent=False),indent=2)+'\n')
+ print('Firmware/runtime differential, frame/reservation audit and actual linked disassembly saved')
+if __name__=='__main__':main()

@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+import hashlib,json,os,runpy,shutil,sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import handoff_trace as trace
+from policy import sha256
+from image import assemble_files,verify
+from diagnostics import SPEC
+from router_config import validate,dns_source
+ROOT=trace.ROOT;BASE=ROOT/'out/router'
+def main():
+ (BASE/'logs').mkdir(parents=True,exist_ok=True)
+ config=validate(json.loads((ROOT/'config/router-v1.json').read_text()))
+ trace.require((ROOT/'pds/wan_dhcp/src/config.rs').read_text()==dns_source(config),'Regenerate compiled DNS configuration')
+ stage=ROOT/'out/gmac-rawio';audit=json.loads((stage/'ARTIFACTS.json').read_text())
+ for p,h in json.loads((stage/'source-hashes.json').read_text()).items():trace.require(sha256(ROOT/p)==h,'Rebuild Stage A: '+p)
+ for p,h in audit['built'].items():trace.require(sha256(stage/p)==h,'Stage A changed')
+ files=[p for folder in ('pds/wan_dhcp','router-core') for p in (ROOT/folder).rglob('*') if p.is_file() and 'target' not in p.parts]
+ files += [ROOT/p for p in ('config/router-v1.json','scripts/build-router','scripts/wan_profile.py','scripts/router_config.py')]
+ inputs={str(p.relative_to(ROOT)):sha256(p) for p in sorted(files)}
+ identity=hashlib.sha256(json.dumps(dict(inputs=inputs,dma=audit['build_id']),sort_keys=True).encode()).hexdigest()[:32]
+ ns=runpy.run_path(str(ROOT/'scripts/build-gmac-rawio'));build=ns['build_pd'];build.__globals__['BASE']=BASE
+ sdk=ROOT/'out/native-net/work/microkit/release/microkit-sdk-2.4.0'
+ shutil.copyfile(stage/'aarch64-sel4.json',BASE/'aarch64-sel4.json')
+ out=BASE/'wan-dhcp';out.mkdir(exist_ok=True)
+ extra={'queue.rs':ROOT/'pds/gmac_dma/src/queue.rs','shared.rs':ROOT/'pds/gmac_probe/src/shared.rs'}
+ shutil.copyfile(build('pds/wan_dhcp','wan-app',sdk,extra=extra),out/'probe.elf')
+ supervisor=BASE/'work/wan-supervisor-source';shutil.copytree(stage/'work/raw-supervisor-src',supervisor,dirs_exist_ok=True)
+ p=supervisor/'src/main.rs';s=p.read_text().replace('shared::read::<15>(0x40002000)','shared::read::<20>(0x40002000)').replace('shared::read::<8>(0x40004000)','shared::read::<24>(0x40004000)')
+ old='if link && app[4]==1 {let age=(time as u32).wrapping_sub(app[3]);if age<5000 {proof=Some(time.saturating_sub(age as u64));}}'
+ trace.require(old in s,'Supervisor anchor changed')
+ s=s.replace(old,'link &= app[9]==1 && driver[19]==app[8];').replace('let mut proof=None;','let proof=None;');p.write_text(s)
+ shutil.copyfile(build(str(supervisor.relative_to(ROOT)),'wan-supervisor',sdk),out/'heartbeat.elf')
+ for name in ('driver.elf','health.elf','loader.elf','sel4.elf','initialiser.elf','monitor.elf'):shutil.copyfile(stage/'gmac-rawio'/name,out/name)
+ xml=(stage/'gmac-rawio/system.system').read_text().replace('name="probe"','name="wan"');(out/'system.system').write_text(xml)
+ payload=out/'loader.img';trace.run([sdk/'bin/microkit',out/'system.system','--board','nanopi_r5s_trace','--config','debug','--search-path',out,'-o',payload,'-r',out/'microkit-report.txt'],BASE/'logs/wan-microkit.log')
+ lock=json.loads((ROOT/'sources.lock').read_text());trace.clone_inputs(BASE/'work',lock)
+ early=runpy.run_path(str(ROOT/'scripts/build-native-net'))['early_header']()
+ trace.build_uboot(BASE,'wan-dhcp',payload,0,early)
+ relative='microkit/build/nanopi_r5s_trace/debug/sel4/build/gen_headers/plat/machine/devices_gen.h';target=BASE/'work'/relative;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/'out/native-net/work'/relative,target)
+ layout=trace.layout(BASE,sdk,payload,out/'loader.elf',out,allowed_mmio=[0xfe2a0000,0xfe2a1000,0xfdc60000,0xfdc20000,0xfdd20000,0xfdd00000,0xfdd60000])
+ for name,start,end in layout['loader_regions']:trace.require(not(0x24000000<end and start<0x24040000),'DMA pool overlaps '+name)
+ trace.require(sum(o['physical'] is not None and 0x24000000<=o['physical']<0x24040000 for o in layout['capdl_objects'])==64,'Pool capability count changed')
+ policy=out/'boot.txt';policy.write_text('Native WAN DHCPv4 client, ARP address-conflict checks and five gateway ICMP probes per lease.\nNo DHCP server, NAT, router, WAN administration or raw diagnostic responder.\nREADY requires current validated lease and fresh gateway ARP. IO_VERIFIED disabled.\nHardware untested; promote only after genuine Stage A packet proof and recovery.\n')
+ firmware=out/'u-boot-rockchip.bin'
+ m=dict(format=7,profile='wan-dhcp',hardware_tested=False,dma_enabled=True,ethernet_enabled=True,diagnostics=SPEC,pool=audit['pool'],build_id=identity,configuration=config,services=['wan-dhcp-client','arp','finite-gateway-icmp'],load_address=0x30000000,ram=[0x20000000,0x40000000],loader=dict(size=payload.stat().st_size,sha256=sha256(payload)),uboot=dict(size=firmware.stat().st_size,sha256=sha256(firmware)),policy_sha256=sha256(policy),lock_sha256=sha256(ROOT/'sources.lock'),sources=lock['sources'])
+ images=[BASE/('r5s-wan-dhcp'+suffix+'.img') for suffix in ('','.reproduced')]
+ for image in images:
+  if image.exists():trace.require(verify(image)==m,'Preserve existing WAN output before rebuild')
+  else:assemble_files(image,firmware,[(payload,'loader.img'),(policy,'boot.txt')],m,sha256(payload)+sha256(firmware))
+ trace.require(sha256(images[0])==sha256(images[1]),'WAN assemblies differ')
+ for p,h in inputs.items():trace.require(sha256(ROOT/p)==h,'Build input changed: '+p)
+ (BASE/'source-hashes.json').write_text(json.dumps(inputs,indent=2)+'\n');(BASE/'layout-report.json').write_text(json.dumps(layout,indent=2)+'\n')
+ (BASE/'wan-manifest.json').write_text(json.dumps(m,indent=2)+'\n')
+ built={images[0].name:sha256(images[0])}
+ (BASE/'ARTIFACTS.json').write_text(json.dumps(dict(built=built,hardware_tested=False,assembly_reproducible=True,withheld=['r5s-lan1-rawio.img','r5s-router-lan1.img','r5s-router-dual-lan.img'],reason='No native PCIe/RTL8125 backend; router core lacks complete fragmentation/PMTU integration'),indent=2)+'\n')
+ print(json.dumps(built))
+if __name__=='__main__':main()

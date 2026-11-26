@@ -1,0 +1,42 @@
+[package]
+name = "r5s-heartbeat"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+
+[dependencies]
+sel4 = { path = "../../vendor/rust-sel4/crates/sel4" }
+sel4-microkit = { path = "../../vendor/rust-sel4/crates/sel4-microkit" }
+
+r5s-router-core = { path = "../../router-core", optional = true }
+
+[features]
+lan-tx-stats = []
+lan-dhcp = ["lan1-only", "dep:r5s-router-core"]
+lan2 = ["lan-dhcp"]
+lan-port = ["supervised", "tx-no-close"]
+lan-bridge = ["lan-port"]
+shared-wan = ["lan-dhcp", "r5s-router-core/shared-nat"]
+forward-workers = ["shared-wan"]
+zc = []
+tso = []
+tso-test = ["tso"]
+gro = ["zc"]
+rx-gro = ["zc"]
+sched-stats = []
+lan-b51-udp = ["shared-wan"]
+lan2-standalone = ["lan2"]
+supervised = ["lan-dhcp"]
+tx-self-test = ["lan-dhcp"]
+tx-no-close = ["lan-dhcp"]
+tx-diagnostic = ["lan-dhcp"]
+tx-check = ["tx-diagnostic", "tx-no-close"]
+tally-rx-first = ["tx-diagnostic"]
+fault-injection = []
+lan1-only = []
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 2
+

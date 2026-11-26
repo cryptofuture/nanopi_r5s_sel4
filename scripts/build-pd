@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parents[1]
+p = argparse.ArgumentParser()
+p.add_argument('--fault-injection', action='store_true')
+args = p.parse_args()
+sdk = root / 'vendor/microkit/release/microkit-sdk-2.4.0'
+headers = sdk / 'board/nanopi_r5s/debug/include'
+if not (headers / 'kernel/gen_config.h').exists():
+    raise SystemExit('Missing restricted-RAM SDK; run scripts/build-sdk first')
+target = json.loads((root / 'vendor/rust-sel4/support/targets/aarch64-sel4.json').read_text())
+target_path = root / 'out/aarch64-sel4.json'
+target_path.write_text(json.dumps(target, indent=2) + '\n')
+env = dict(os.environ, SEL4_INCLUDE_DIRS=str(headers), RUSTUP_TOOLCHAIN='nightly-2026-08-21')
+cmd = ['cargo', 'build', '--manifest-path', str(root / 'pds/heartbeat/Cargo.toml'),
+       '--release', '--locked', '-Zbuild-std=core,alloc,compiler_builtins',
+       '-Zbuild-std-features=compiler-builtins-mem', '-Zjson-target-spec',
+       '--target', str(target_path)]
+if args.fault_injection:
+    cmd += ['--features', 'fault-injection']
+subprocess.run(cmd, env=env, check=True)
+suffix = '-fault' if args.fault_injection else ''
+shutil.copy2(root / 'pds/heartbeat/target/aarch64-sel4/release/r5s-heartbeat.elf',
+             root / f'out/heartbeat{suffix}.elf')
+with tempfile.TemporaryDirectory(dir=root / 'out') as temporary:
+    search = Path(temporary)
+    shutil.copy2(root / f'out/heartbeat{suffix}.elf', search / 'heartbeat.elf')
+    subprocess.run([str(sdk / 'bin/microkit'), str(root / 'microkit/system.system'),
+                    '--board', 'nanopi_r5s', '--config', 'debug', '--search-path', str(search),
+                    '-o', str(root / f'out/loader{suffix}.img'),
+                    '-r', str(root / f'out/microkit-report{suffix}.txt')],
+                   check=True)

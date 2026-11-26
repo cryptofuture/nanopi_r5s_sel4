@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+import gzip
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import sys
+import tarfile
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from image import verify
+from policy import sha256
+ROOT=Path(__file__).resolve().parents[1]
+BASE=ROOT/'out/native-net'
+
+def main():
+    image=BASE/'r5s-runtime-baseline-v2.img'
+    manifest=verify(image)
+    if manifest['profile']!='runtime-baseline-v2':raise ValueError('Unexpected profile')
+    a=json.loads((BASE/'ARTIFACTS.json').read_text())
+    if sha256(image)!=a['built'][image.name]:raise ValueError('Artifact hash differs')
+    for path,digest in a['preserved'].items():
+        if sha256(ROOT/path)!=digest:raise ValueError(f'Preserved artifact changed: {path}')
+    stage=BASE/'bundle/native-net'
+    if stage.exists():shutil.rmtree(stage)
+    stage.mkdir(parents=True)
+    paths=['scripts/flash-sd','scripts/verify-image','scripts/image.py','scripts/policy.py','scripts/diag_profile.py','scripts/trace_profile.py','scripts/native_profile.py','scripts/collect-gmac-evidence','scripts/native_layout.py','scripts/build-native-net','scripts/package-native-net','scripts/diagnostics.py','scripts/handoff_trace.py','scripts/build-trace-sdk','scripts/env',
+        'docs/native-net.md','docs/native-net-results.md','docs/diagnostics-v2.md',
+        'tools/net-peer','tools/netprobe/wire.py','protocol/diagnostics-v2.json','protocol/raw-v1.json','protocol/runtime-status-v1.json','drivers/gmac0/mdio.c','drivers/gmac0/mdio.h','drivers/gmac0/ring.c','drivers/gmac0/ring.h','drivers/gmac0/README.md','boards/nanopi-r5s/gmac0-evidence.json','tests/test_native_net.py','tests/gmac_ring_test.c','sources.lock']
+    paths += [str(p.relative_to(ROOT)) for p in (ROOT/'pds/diagnostics').rglob('*') if p.is_file() and 'target' not in p.parts]
+    paths += ['pds/net_probe/src/lib.rs']
+    paths += [str(p.relative_to(ROOT)) for p in (ROOT/'drivers/gmac0/reference').iterdir() if p.is_file()]
+    for name in paths:
+        target=stage/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/name,target)
+    for name in (image.name,'r5s-runtime-baseline-v2.manifest.json','ARTIFACTS.json','layout-report.json','dma-map.json','native-sources.lock','source-hashes.json','system.system','heartbeat.elf','health.elf'):
+        shutil.copyfile(BASE/name,stage/name)
+    for name in ('logs','patches','objects'):shutil.copytree(BASE/name,stage/name,ignore=shutil.ignore_patterns('__pycache__','package.log'))
+    profile=stage/'runtime-baseline-v2';profile.mkdir()
+    source=BASE/'runtime-baseline-v2'
+    for name in ('loader.img','boot.txt','loader.elf','sel4.elf','monitor.elf','initialiser.elf','u-boot.elf','uboot.config','uboot-r5s_trace.h','r5s_payload.h','microkit-report.txt','config-delta.json'):
+        shutil.copyfile(source/name,profile/name)
+    shutil.copyfile(source/'build/u-boot.map',profile/'u-boot.map')
+    sdk=BASE/'work/microkit/release/microkit-sdk-2.4.0/board/nanopi_r5s_trace/debug'
+    shutil.copytree(sdk/'include',stage/'sdk-include')
+    files=sorted(p for p in stage.rglob('*') if p.is_file())
+    (stage/'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.relative_to(stage)}\n' for p in files))
+    bundle=BASE/'native-net-handoff.tar.gz'
+    with bundle.open('wb') as raw,gzip.GzipFile(filename='',mode='wb',fileobj=raw,mtime=0) as gz,tarfile.open(fileobj=gz,mode='w') as tar:
+        for path in [stage,*sorted(stage.rglob('*'))]:
+            info=tar.gettarinfo(str(path),arcname='native-net'+('/'+str(path.relative_to(stage)) if path!=stage else ''))
+            info.uid=info.gid=0;info.uname=info.gname='';info.mtime=0
+            info.mode=0o755 if path.is_dir() else 0o644
+            if path.is_file():
+                with path.open('rb') as stream:tar.addfile(info,stream)
+            else:tar.addfile(info)
+    bundle.with_name(bundle.name+'.sha256').write_text(f'{sha256(bundle)}  {bundle.name}\n')
+    print(bundle,sha256(bundle))
+if __name__=='__main__':main()

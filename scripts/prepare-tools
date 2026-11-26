@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
+import tarfile
+import urllib.request
+from policy import sha256
+
+root = Path(__file__).resolve().parents[1]
+p = argparse.ArgumentParser(description='Prepare project-local build tools; no system installation')
+p.add_argument('--fetch', action='store_true')
+args = p.parse_args()
+if platform.system() != 'Linux' or platform.machine() != 'x86_64':
+    sys.exit('This tool cache is pinned for Debian 13 x86_64; use that builder/VM')
+lock = json.loads((root / 'sources.lock').read_text())
+tools = root / 'tools'
+
+
+def download(path, url, digest):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if sha256(path) != digest:
+            sys.exit(f'Cached file hash mismatch: {path}')
+        return
+    if not args.fetch:
+        sys.exit(f'Cache missing: {path}; --fetch allows download')
+    temporary = path.with_suffix(path.suffix + '.part')
+    urllib.request.urlretrieve(url, temporary)
+    if sha256(temporary) != digest:
+        temporary.unlink()
+        sys.exit(f'Download hash mismatch: {url}')
+    temporary.rename(path)
+
+
+archive = tools / 'arm-toolchain.tar.xz'
+download(archive, lock['toolchain_url'], lock['files']['tools/arm-toolchain.tar.xz'])
+compiler = tools / 'arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf'
+if not compiler.exists():
+    with tarfile.open(archive) as stream:
+        stream.extractall(tools, filter='data')
+for name, entry in lock['host_debs'].items():
+    path = tools / 'debs' / name
+    download(path, entry['url'], entry['sha256'])
+    subprocess.run(['dpkg-deb', '-x', str(path), str(tools / 'host')], check=True)
+for name, entry in lock['python_artifacts'].items():
+    download(tools / 'wheels' / name, entry['url'], entry['sha256'])
+wheels = str(tools / 'wheels')
+subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-index', '--find-links', wheels,
+                '--target', str(tools / 'python'), 'virtualenv==21.15.6'], check=True)
+env = dict(os.environ, PYTHONPATH=str(tools / 'python'))
+subprocess.run([sys.executable, '-m', 'virtualenv', '--no-download', str(tools / 'venv')],
+               env=env, check=True)
+subprocess.run([str(tools / 'venv/bin/pip'), 'install', '--no-index', '--find-links', wheels,
+                '-r', str(root / 'requirements.lock')], check=True)
+if args.fetch:
+    subprocess.run(['rustup', 'toolchain', 'install', lock['rust'], '--profile', 'minimal',
+                    '--component', 'rust-src', '--target', 'aarch64-unknown-none'], check=True)
+print('Local tools prepared. Source scripts/env; verify Rust/Cargo caches for offline builds.')

@@ -1,0 +1,7 @@
+DEVTYPE=PHY
+DRIVER=RTL8211F Gigabit Ethernet
+OF_NAME=phy
+OF_FULLNAME=/ethernet@fe2a0000/mdio/phy@1
+OF_COMPATIBLE_0=ethernet-phy-ieee802.3-c22
+OF_COMPATIBLE_N=1
+MODALIAS=of:NphyT(null)Cethernet-phy-ieee802.3-c22

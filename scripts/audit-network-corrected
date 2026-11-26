@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import sys,json,difflib,subprocess
+ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'scripts'))
+from policy import sha256
+from image import verify
+b=ROOT/'out/network-corrected';r=verify(b/'rawio/r5s-gmac-rawio.img');w=verify(b/'wan/r5s-wan-dhcp.img')
+p=b/'operator.md';s=p.read_text();s=s.replace('Peer command will appear below after the final build identity is generated.',f'''On the development computer, copy this bundle's tools/net-peer and tools/netprobe directory to the dedicated Linux peer (or run them locally if it is the peer). From that extracted bundle directory:
+
+```sh
+read -r -p 'Dedicated test Ethernet interface: ' PEER_IFACE
+test -n "$PEER_IFACE"
+sudo python3 tools/net-peer --interface "$PEER_IFACE" --target 02:52:35:53:00:01 --build-id {r['build_id']} --count 1000 --rate 1 --report rawio-corrected-1000.json
+```
+
+Choose a physically dedicated port. The utility does not determine whether the selected interface carries management traffic.''');p.write_text(s)
+images={str(p.relative_to(b)):sha256(p) for p in [b/'rawio/r5s-gmac-rawio.img',b/'wan/r5s-wan-dhcp.img']}
+(b/'SHA256SUMS').write_text(''.join(f'{v}  {k}\n' for k,v in images.items()))
+(b/'ARTIFACTS.json').write_text(json.dumps(dict(images=images,build_ids={'rawio':r['build_id'],'wan':w['build_id']},hardware_tested=False,assembly_reproducible=True,preflight='user observed READY with policy correction; latest recovery not supplied',promotion={'rawio':'requires preflight recovery','wan':'requires fresh external raw exchange and recovery'},dma_isolation='ARM_SMMU disabled; drivers trusted; confinement unproven'),indent=2)+'\n')
+patch=''
+for old,new in [('pds/gmac_dma','pds/gmac_dma_corrected'),('pds/gmac_supervisor','pds/network_supervisor')]:
+ for f in sorted((ROOT/new).rglob('*')):
+  if not f.is_file():continue
+  prev=ROOT/old/f.relative_to(ROOT/new);before=prev.read_text() if prev.is_file() else ''
+  patch+=''.join(difflib.unified_diff(before.splitlines(True),f.read_text().splitlines(True),fromfile=str(prev.relative_to(ROOT)),tofile=str(f.relative_to(ROOT))))
+(b/'corrections.patch').write_text(patch)
+for directory,profile in [('rawio','gmac-rawio'),('wan','wan-dhcp')]:
+ out=b/directory/profile
+ for name in ['driver','heartbeat','probe']:
+  with (b/'logs'/f'{directory}-{name}-symbols.txt').open('w') as f:subprocess.run(['aarch64-none-elf-nm','-S',out/f'{name}.elf'],stdout=f,check=True)
+  with (b/'logs'/f'{directory}-{name}-disassembly.txt').open('w') as f:subprocess.run(['aarch64-none-elf-objdump','-d',out/f'{name}.elf'],stdout=f,check=True)
+ paths=list((b/'rawio/work/driver-gmac-rawio/target').rglob('link-profile.c'));assert len(paths)==1;(b/'compiled-link.c').write_bytes(paths[0].read_bytes())
+for directory,profile in [('rawio','gmac-rawio'),('wan','wan-dhcp')]:
+ base=b/directory;assert sha256(base/f'r5s-{profile}.img')==sha256(base/f'r5s-{profile}.reproduced.img')
+ for p,h in json.loads((base/'source-hashes.json').read_text()).items():assert sha256(ROOT/p)==h,p
+for p,h in json.loads((b/'rawio/ARTIFACTS.json').read_text())['preserved'].items():assert sha256(ROOT/p)==h,p
+print(json.dumps(dict(images=images,raw_build_id=r['build_id']),indent=2))

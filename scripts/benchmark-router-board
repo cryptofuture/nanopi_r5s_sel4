@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Run wired iperf3 and concurrent ICMP latency tests from an endpoint."""
+import argparse
+from contextlib import ExitStack
+import json
+import math
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("server", help="Remote wired iperf3 server")
+parser.add_argument("output", type=Path)
+parser.add_argument("--ping", required=True, help="Reachable target across the forwarding path")
+parser.add_argument("--gateway", help="On-link router address for a second latency probe")
+parser.add_argument("--seconds", type=int, default=30)
+parser.add_argument("--start-at", type=float, help="Shared Unix time for the first traffic case")
+parser.add_argument("--server-port", type=int, default=5201)
+parser.add_argument("--bind", help="Source address for the local iperf3 client")
+parser.add_argument("--case", action="append", help="Run only the specified test name")
+parser.add_argument("--udp-rate", action="append", default=[], help="iperf3 bandwidth, e.g. 900M")
+parser.add_argument("--interface", help="Local Ethernet interface for link evidence")
+parser.add_argument("--label", required=True, help="Firmware hash and direction under test")
+parser.add_argument("--diagnostics", help="On-link B51 diagnostic address")
+parser.add_argument("--status-interval", type=int, default=30, help="Seconds between loaded samples, or zero")
+diagnostic_mode = parser.add_mutually_exclusive_group()
+diagnostic_mode.add_argument("--scheduler", action="store_true", help="Request PMU samples from a benchmark image")
+diagnostic_mode.add_argument("--rss", action="store_true", help="Request B51 per-queue counters from an RSS image")
+diagnostic_mode.add_argument("--queues", action="store_true", help="Sample hardware queue descriptor counts")
+diagnostic_mode.add_argument("--lan-tx", action="store_true", help="Sample per-worker direct LAN TX backlog")
+args = parser.parse_args()
+if args.seconds < 1:
+    parser.error("--seconds must be positive")
+if not 1 <= args.server_port <= 65535 or args.status_interval < 0:
+    parser.error("Invalid server port or status interval")
+if (args.scheduler or args.rss or args.queues or args.lan_tx) and not args.diagnostics:
+    parser.error("A diagnostic mode requires --diagnostics")
+if args.start_at is not None and (not math.isfinite(args.start_at) or args.start_at <= time.time()):
+    parser.error("--start-at must be a future Unix timestamp")
+scripts = Path(__file__).resolve().parent
+cases = {"tcp-1": [], "tcp-4": ["-P", "4"], "tcp-8": ["-P", "8"],
+         "tcp-reverse-1": ["-R"], "tcp-reverse-4": ["-P", "4", "-R"],
+         "tcp-16": ["-P", "16"], "tcp-reverse": ["-P", "8", "-R"],
+         "tcp-bidir": ["-P", "8", "--bidir"]}
+for index, rate in enumerate(args.udp_rate, 1):
+    cases[f"udp-{index}"] = ["-u", "-b", rate]
+    cases[f"udp-{index}-reverse"] = ["-u", "-b", rate, "-R"]
+
+
+if args.case:
+    unknown = set(args.case) - cases.keys()
+    if unknown:
+        parser.error(f"Unknown test names {sorted(unknown)}")
+    cases = {name: cases[name] for name in dict.fromkeys(args.case)}
+args.output.mkdir(parents=True)
+
+
+def capture(name, command):
+    with (args.output / name).open("w") as log:
+        return subprocess.run(command, stdout=log, stderr=subprocess.STDOUT).returncode
+
+
+def latency(name):
+    log = (args.output / name).read_text()
+    values = sorted(float(value) for value in re.findall(r"time[=<]([0-9.]+) ms", log))
+    loss = re.search(r"([0-9.]+)% packet loss", log)
+    return {"samples": len(values), "loss_percent": float(loss[1]) if loss else None,
+            **{f"p{p}_ms": values[math.ceil(len(values) * p / 100) - 1]
+               if len(values) >= minimum else None for p, minimum in [(50, 1), (95, 20), (99, 100)]}}
+
+
+def diagnostics(name, timeout=12):
+    if args.diagnostics:
+        command = [sys.executable, scripts / "read-b51-udp", args.diagnostics, "--live", "--timeout", str(timeout)]
+        if args.scheduler:
+            command.append("--scheduler")
+        if args.rss:
+            command.append("--rss")
+        if args.queues:
+            command.append("--queues")
+        if args.lan_tx:
+            command.append("--lan-tx")
+        return capture(name, command)
+    return None
+
+
+def queue_deltas(before_file, after_file):
+    try:
+        before, after = (json.loads((args.output / name).read_text())
+                         for name in (before_file, after_file))
+    except (OSError, ValueError):
+        return None
+    if any(not isinstance(sample, dict) or sample.get("state") != "live" for sample in (before, after)):
+        return None
+    result = {}
+    for port in ("wan", "lan1", "lan2"):
+        start, end = (sample.get(port) for sample in (before, after))
+        if not isinstance(start, dict) or not isinstance(end, dict):
+            continue
+        for key in ("rx_allocation_failures", "rx_copied_packets", "rx_copied_bytes",
+                    "rx_queue_drops", "tx_queue_drops", "dma_drops", "rx_completed", "tx_completed",
+                    "rx_unavailable_events", "nat_copy_checksum_bypass",
+                    "learning_submitted", "learning_upload_drops"):
+            old, new = start.get(key), end.get(key)
+            if type(old) is int and type(new) is int:
+                saturated = key.startswith(("rx_allocation", "rx_copied")) and new == 0xffffffff
+                result.setdefault(port, {})[key] = [new - old if new >= old and not saturated else None]
+        pairs = {key: (start.get(key), end.get(key)) for key in (
+            "tx_channel_retired_descriptors", "rx_channel_retired_descriptors", "tx_queue_retired_descriptors")}
+        if isinstance(start.get("rss"), dict) and isinstance(end.get("rss"), dict):
+            pairs["rx_queue_packets"] = (start["rss"].get("packets_per_queue"),
+                                          end["rss"].get("packets_per_queue"))
+        for key, (old, new) in pairs.items():
+            if (isinstance(old, list) and isinstance(new, list) and len(old) == len(new)
+                    and old and all(type(x) is int and 0 <= x < 2**32 for x in old + new)):
+                result.setdefault(port, {})[key] = [b - a if b >= a else None for a, b in zip(old, new)]
+            elif old is not None or new is not None:
+                result.setdefault(port, {})[key] = None
+    return result or None
+
+def iperf_metrics(name, options):
+    try:
+        raw = json.loads((args.output / f"{name}.json").read_text())
+        end = raw["end"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return {}
+    if not isinstance(end, dict):
+        return {}
+    directions = {}
+    for label, suffix in [(("server_to_client" if "-R" in options else "client_to_server"), ""),
+                          ("server_to_client", "_bidir_reverse")]:
+        sender = end.get("sum_sent" + suffix, {})
+        receiver = end.get("sum_received" + suffix, {})
+        if not suffix and "-u" in options and not receiver:
+            receiver = end.get("sum", {})
+        if sender or receiver:
+            directions[label] = {"sender_bps": sender.get("bits_per_second"),
+                                 "receiver_bps": receiver.get("bits_per_second"),
+                                 "tcp_retransmits": sender.get("retransmits"),
+                                 **{key: receiver.get(key) for key in ("packets", "lost_packets", "lost_percent", "jitter_ms")}}
+    return directions
+
+
+def run_case(name, options):
+    with ExitStack() as handles:
+        def start(filename, command):
+            log = handles.enter_context((args.output / filename).open("w"))
+            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+            def stop():
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+            handles.callback(stop)
+            return process
+
+        ping_file = f"{name}-ping.txt"
+        probes = [start(ping_file, [*ping, "-w", str(args.seconds + 1), args.ping])]
+        if args.gateway:
+            probes.append(start(f"{name}-gateway.txt", [*ping, "-w", str(args.seconds + 1), args.gateway]))
+        command = ["iperf3", "-J", "-c", args.server, "-p", str(args.server_port), "-t", str(args.seconds), *options]
+        if args.bind:
+            command.extend(["-B", args.bind])
+        traffic = start(f"{name}.json", command)
+        started = time.monotonic()
+        end = started + args.seconds + 15
+        sample = started + args.status_interval if args.diagnostics and args.status_interval else end
+        status = []
+        while traffic.poll() is None:
+            now = time.monotonic()
+            if now >= end:
+                traffic.kill()
+                traffic.wait()
+                break
+            if now >= sample:
+                elapsed = int(now - started)
+                filename = f"{name}-status-{elapsed:04d}s.json"
+                status.append({"elapsed_seconds": elapsed, "file": filename,
+                               "exit_code": diagnostics(filename, min(5, args.status_interval))})
+                sample += args.status_interval
+                while sample <= time.monotonic():
+                    sample += args.status_interval
+                continue
+            try:
+                traffic.wait(timeout=min(sample, end) - now)
+            except subprocess.TimeoutExpired:
+                continue
+        # Let ping write its summary before the handles close.
+        deadline = started + args.seconds + 5
+        for process in probes:
+            try:
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    metrics = iperf_metrics(name, options)
+    return {"exit_code": traffic.returncode, "options": options, **latency(ping_file),
+            "iperf": metrics, "loaded_status": status,
+            "gateway": latency(f"{name}-gateway.txt") if args.gateway else None}
+
+
+if args.interface:
+    capture("link.txt", ["ethtool", args.interface])
+initial_status = diagnostics("status-before.json")
+ping = ["ping", "-n", "-i", "0.2", "-W", "1"]
+capture("idle-ping.txt", [*ping, "-w", str(min(30, args.seconds)), args.ping])
+report = {"label": args.label, "server": args.server, "seconds": args.seconds,
+          "server_port": args.server_port, "bind": args.bind, "status_before_exit_code": initial_status,
+          "idle": latency("idle-ping.txt"), "cases": {}}
+if args.gateway:
+    capture("idle-gateway.txt", [*ping, "-w", str(min(30, args.seconds)), args.gateway])
+    report["idle_gateway"] = latency("idle-gateway.txt")
+if args.start_at is not None:
+    delay = args.start_at - time.time()
+    if delay <= 0:
+        parser.error("The scheduled start elapsed during idle sampling")
+    time.sleep(delay)
+report["started_unix"] = time.time()
+for name, options in cases.items():
+    before = f"{name}-status-before.json"
+    if args.queues:
+        if args.start_at is not None and not report["cases"]:
+            before, before_status = "status-before.json", initial_status
+        else:
+            before_status = diagnostics(before)
+    result = run_case(name, options)
+    after = f"{name}-status.json"
+    result["status_after_exit_code"] = diagnostics(after)
+    if args.queues:
+        result["status_before_exit_code"] = before_status
+        result["queue_counter_samples"] = [before, after] if args.diagnostics else None
+        result["queue_counter_deltas"] = (queue_deltas(before, after)
+                                           if before_status == result["status_after_exit_code"] == 0 else None)
+    if args.diagnostics:
+        result["diagnostics_complete"] = (result["status_after_exit_code"] == 0
+            and all(sample["exit_code"] == 0 for sample in result["loaded_status"]))
+        if args.queues:
+            deltas = result["queue_counter_deltas"]
+            result["diagnostics_complete"] &= bool(deltas and all(
+                series is not None and all(value is not None for value in series)
+                for port in deltas.values() for series in port.values()))
+    report["cases"][name] = result
+(args.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+sys.exit(int((args.diagnostics and initial_status != 0) or any(
+    case["exit_code"] or not case["iperf"] or not case.get("diagnostics_complete", True)
+    for case in report["cases"].values())))

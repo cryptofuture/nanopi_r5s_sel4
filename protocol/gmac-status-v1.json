@@ -1,0 +1,8 @@
+{
+ "version":1,"virtual_address":"0x40002000","page_size":4096,
+ "publisher":"native gmac PD","reader":"diagnostics supervisor, read-only mapping",
+ "atomicity":"u32 atomics, odd/even release/acquire sequence; two reader attempts, bounded fresh cached snapshot",
+ "fields":{"0":"sequence","4":"version","8":"state: INIT=0 WAIT=1 LINK=2 FAULT=3","12":"fault_reason","16":"update_ms_low32","20":"last_valid_phy_read_ms_low32","24":"speed_mbps","28":"full_duplex","32":"mac_version","36":"phy_id","40":"mac_input_clock_hz"},
+ "driver_fresh_ms":100,"phy_fresh_ms":500,"phy_poll_ms":200,"publication_interval_ms":1,
+ "persistent":false,"packet_io_proof":false
+}

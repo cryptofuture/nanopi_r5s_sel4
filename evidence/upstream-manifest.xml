@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+   Copyright 2026 seL4 Project a Series of LF Projects, LLC
+   SPDX-License-Identifier: BSD-2-Clause
+-->
+<manifest>
+  <remote name="seL4" fetch="../seL4"/>
+  
+  <default revision="main"/>
+  
+  <project name="microkit" remote="seL4" revision="30e1406490d60f446db2a78fd131f3909a62699e" upstream="main" dest-branch="main"/>
+  <project name="seL4" remote="seL4" revision="62e345c240a15671484530b4e6e069ce266c28d7" upstream="master"/>
+</manifest>

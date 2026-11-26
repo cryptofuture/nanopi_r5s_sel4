@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+import gzip,json,shutil,sys,tarfile
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from image import verify
+from policy import sha256
+ROOT=Path(__file__).resolve().parents[1];BASE=ROOT/'out/gmac-bringup'
+def main():
+ artifact=json.loads((BASE/'ARTIFACTS.json').read_text());image=BASE/'r5s-gmac-link.img'
+ if verify(image)['profile']!='gmac-link' or sha256(image)!=artifact['built'][image.name]:raise ValueError('Unverified link image')
+ for name,digest in artifact['preserved'].items():
+  if sha256(ROOT/name)!=digest:raise ValueError('Preserved input changed: '+name)
+ for name,digest in json.loads((BASE/'source-hashes.json').read_text()).items():
+  if sha256(ROOT/name)!=digest:raise ValueError('Source changed after build: '+name)
+ prior=json.loads((ROOT/'out/native-net/source-hashes.json').read_text())
+ if sha256(ROOT/'scripts/flash-sd')!=prior['scripts/flash-sd']:raise ValueError('Writer differs from known working version')
+ stage=BASE/'bundle/gmac-bringup'
+ if stage.exists():shutil.rmtree(stage)
+ stage.mkdir(parents=True)
+ paths=['scripts/flash-sd','scripts/verify-image','scripts/image.py','scripts/policy.py','scripts/diag_profile.py','scripts/trace_profile.py','scripts/native_profile.py','scripts/gmac_profile.py','scripts/diagnostics.py','scripts/gmac_evidence.py','scripts/fdt_evidence.py','scripts/resolve-gmac-evidence','scripts/generate-gmac-config','scripts/build-gmac-bringup','scripts/package-gmac-bringup','scripts/handoff_trace.py','scripts/env','docs/gmac-bringup.md','docs/gmac-hardware-audit.md','docs/dma-strategy.md','docs/gmac-bringup-results.md','docs/diagnostics-v2.md','protocol/diagnostics-v2.json','protocol/gmac-status-v1.json','protocol/raw-v1.json','tools/net-peer','tools/netprobe/wire.py','pds/net_probe/src/lib.rs','tests/test_gmac_bringup.py','tests/gmac_link_test.c','tests/test_native_net.py','tests/gmac_ring_test.c','sources.lock']
+ for dirname in ('drivers/gmac0','pds/gmac_link','pds/gmac_supervisor'):
+  paths += [str(p.relative_to(ROOT)) for p in (ROOT/dirname).rglob('*') if p.is_file() and 'target' not in p.parts and '__pycache__' not in p.parts]
+ for name in paths:
+  target=stage/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/name,target)
+ files=['r5s-gmac-link.img','r5s-gmac-link.manifest.json','ARTIFACTS.json','evidence-index.json','gmac0-resolved.json','dma-map.json','layout-report.json','source-hashes.json','gmac-sources.lock','platform-writes.json','system.system','driver.elf','supervisor.elf','health.elf','runtime-original.dts']
+ for name in files:shutil.copyfile(BASE/name,stage/name)
+ for name in ('logs','patches','objects','references'):shutil.copytree(BASE/name,stage/name,ignore=shutil.ignore_patterns('__pycache__','package.log','bundle-*'))
+ p=BASE/'gmac-link';target=stage/'gmac-link';target.mkdir()
+ for name in ('loader.img','boot.txt','loader.elf','sel4.elf','monitor.elf','initialiser.elf','u-boot.elf','uboot.config','uboot-r5s_trace.h','r5s_payload.h','microkit-report.txt','config-delta.json'):shutil.copyfile(p/name,target/name)
+ shutil.copyfile(p/'build/u-boot.map',target/'u-boot.map')
+ manifests=stage/'manifests';manifests.mkdir();shutil.copyfile(BASE/'r5s-gmac-link.manifest.json',manifests/'r5s-gmac-link.manifest.json')
+ (BASE/'manifests').mkdir(exist_ok=True);shutil.copyfile(BASE/'r5s-gmac-link.manifest.json',BASE/'manifests/r5s-gmac-link.manifest.json')
+ evidence=stage/'evidence';evidence.mkdir();shutil.copyfile(ROOT/'r5s-gmac-evidence.tar.gz',evidence/'r5s-gmac-evidence.tar.gz')
+ captured=ROOT/'evidence/gmac-captured-1e089e3a/inner/gmac-evidence'
+ for name in ('runtime-original.dtb','runtime-reconstructed.dtb','metadata.json','driver.txt','link.txt','cmdline','iomem','dtc.log'):shutil.copyfile(captured/name,evidence/name)
+ shutil.copytree(captured/'mdio',evidence/'mdio')
+ (stage/'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.relative_to(stage)}\n' for p in sorted(stage.rglob('*')) if p.is_file()))
+ bundle=BASE/'r5s-gmac-bringup-handoff.tar.gz'
+ with bundle.open('wb') as raw,gzip.GzipFile(filename='',mode='wb',fileobj=raw,mtime=0) as gz,tarfile.open(fileobj=gz,mode='w') as tar:
+  for path in [stage,*sorted(stage.rglob('*'))]:
+   info=tar.gettarinfo(str(path),arcname='gmac-bringup'+('/'+str(path.relative_to(stage)) if path!=stage else ''))
+   info.uid=info.gid=0;info.uname=info.gname='';info.mtime=0;info.mode=0o755 if path.is_dir() else 0o644
+   if path.is_file():
+    with path.open('rb') as stream:tar.addfile(info,stream)
+   else:tar.addfile(info)
+ bundle.with_name(bundle.name+'.sha256').write_text(f'{sha256(bundle)}  {bundle.name}\n')
+ print(bundle,sha256(bundle))
+if __name__=='__main__':main()

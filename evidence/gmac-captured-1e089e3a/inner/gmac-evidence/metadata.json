@@ -1,0 +1,19 @@
+{
+  "model": "FriendlyElec NanoPi R5S",
+  "destination_mount": {
+    "source": "overlay",
+    "fstype": "overlay",
+    "maj:min": "0:27",
+    "options": "rw,relatime,lowerdir=/root,upperdir=/data/root,workdir=/data/work"
+  },
+  "original_fdt": true,
+  "reconstructed_returncode": 0,
+  "links": {
+    "device": "/sys/devices/platform/fe2a0000.ethernet",
+    "device/driver": "/sys/bus/platform/drivers/rk_gmac-dwmac",
+    "device/of_node": "/sys/firmware/devicetree/base/ethernet@fe2a0000",
+    "phydev": "/sys/devices/platform/fe2a0000.ethernet/mdio_bus/stmmac-0/stmmac-0:01"
+  },
+  "driver_returncode": 0,
+  "link_returncode": 0
+}

@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Run with scripts/env sourced. Each invocation creates one fresh matrix directory."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+from image import assemble_files, verify
+from policy import sha256
+
+root = Path(__file__).resolve().parents[1]
+baseline = root / "out/b51-register-recheck.2A7u4tOs/image"
+name = "r5s-rtl8125-lan-repair.img"
+reference = "cdb4ea3ece0684bb658531baf610b108bd31e9f3470a8c03dba16b7b4fdf5d8f"
+modes = {"B": ("1", "observe"), "C": ("0", "observe"),
+         "D": ("1", "tx-check"), "E": ("1", "tally-rx-first"), "W": ("1", "observe")}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("variant", choices=["A", *modes])
+    parser.add_argument("destination", type=Path)
+    args = parser.parse_args()
+    dest = args.destination.resolve()
+    if dest.exists():
+        parser.error("Choose a fresh directory")
+    if args.variant == "A":
+        image = baseline / name
+        if sha256(image) != reference:
+            raise ValueError("Baseline image identity mismatch")
+        manifest = verify(image)
+        payload = baseline / "layout.bin"
+        boot = baseline / "rtl8125-lan-repair"
+        assemble_files(dest / name, boot / "u-boot-rockchip.bin",
+                       [(payload, "loader.img"), (boot / "boot.txt", "boot.txt")],
+                       manifest, manifest["loader"]["sha256"] + manifest["uboot"]["sha256"])
+        if sha256(dest / name) != reference:
+            raise ValueError("Reassembled baseline differs")
+    else:
+        mode, experiment = modes[args.variant]
+        subprocess.run(["python3", root / "scripts/build-lan1-bringup", dest, "--lan-repair=lan1"],
+                       cwd=root, check=True, env=dict(os.environ, R5S_LAN1_TX_DIAGNOSTIC="1",
+                       R5S_B51_WAN_UDP="1" if args.variant == "W" else "0", R5S_LAN1_TX_NO_CLOSE=mode, R5S_B51_EXPERIMENT=experiment))
+    if verify(dest / name) != json.loads((dest / name).with_suffix(".manifest.json").read_text()):
+        raise ValueError("Manifest mismatch")
+    subprocess.run(["sha256sum", "-c", Path(name).with_suffix(".sha256")], cwd=dest, check=True)

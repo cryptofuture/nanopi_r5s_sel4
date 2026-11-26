@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+import gzip
+import shutil
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+from image import verify
+from policy import sha256
+
+root = Path(__file__).resolve().parents[1]
+base = root / 'out/router-lan1-bringup'
+first, second = (Path(name).resolve() for name in sys.argv[1:])
+image = 'r5s-lan1-bringup.img'
+if first.samefile(second) or verify(first / image).get('profile') != 'lan1-bringup':
+    sys.exit('Expected two independent LAN1 image builds')
+if sha256(first / image) != sha256(second / image):
+    sys.exit('Independent LAN1 images differ')
+shutil.copyfile(first / image, base / image)
+docs = root / 'docs/lan1-bringup'
+for name in ['operator.md','dma-map.md','implementation-report.md']:
+    shutil.copyfile(docs / name, base / name)
+stages = [
+    'RTL8125 PCI identity confirmed','B51 signature confirmed','Private pool mapping confirmed',
+    'Inbound iATU configured','Controller reset complete','PHY initialization complete',
+    'Autonegotiation and PHY link','Descriptor bases and queue configuration verified',
+    'PCIe bus mastering enabled','Valid RX DMA completion','ARP request for 10.44.1.1',
+    'ARP reply submitted','TX descriptor completed',
+]
+failures = {
+    32:'DMA pool mapping or allocation failure',33:'iATU mode, layout, capability or readback mismatch',
+    34:'iATU enable/disable poll timeout',35:'B51 MAC, PHY or OOB initialization failure',
+    36:'Firmware execution, version or patch-handshake failure',37:'PHY negotiation timeout',
+    38:'Descriptor initialization, base or queue configuration failure',40:'No valid RX completion before timeout',
+    41:'TX completion failed or timed out',42:'Shutdown or quiescence could not be confirmed',
+    43:'DMA start, submission, backend or controller error',44:'RX completed, no matching ARP before timeout',
+    65:'Counter frequency or PCIe reference clock',66:'PCIe clock gate readback',67:'PIPE power timeout',
+    68:'PIPE idle timeout',69:'Reset or GPIO readback',70:'PCIe PHY readiness',71:'PCIe link training',
+    72:'PCI configuration access or identity',73:'BAR sizing, allocation or readback',
+    74:'Unsupported TxConfig or method',75:'MMIO mapping or access',
+}
+def word(code):
+    bits = f'{code:07b}{code.bit_count()%2}'.translate(str.maketrans('01','SL'))
+    return f'{bits[:4]} / {bits[4:]}'
+codes = dict(enumerate(stages,1)) | failures
+(base / 'fault-codes.md').write_text(
+    '# LAN1 SYS words\n\nA steady five-second ON preamble identifies a LAN1 word. WAN words start with rapid flutter. '
+    'Read four symbols, a dark separator and four more symbols. S is 0.4 seconds ON and L is 2 seconds ON. '
+    'Each frame lasts 42.5 seconds. WAN fatal reports take priority. '
+    'New LAN milestones and stored history alternate with the WAN rotation. A shutdown fault can also report the preceding failure. '
+    'Word 13 records TX ownership completion. Confirm wire delivery independently with the Linux capture.\n\n'
+    '| Banked ID | SYS word | Meaning |\n|---:|---|---|\n' +
+    ''.join(f'| {i} | {word(i)} | {codes[i]} |\n' for i in sorted(codes)) + '\n' +
+    (root / 'out/router-wan-dhcp-repair/fault-codes.md').read_text())
+with tempfile.TemporaryDirectory(dir=base) as tmp:
+    stage = Path(tmp) / base.name
+    stage.mkdir()
+    for name in [image,'operator.md','dma-map.md','implementation-report.md','fault-codes.md','test-results.md']:
+        shutil.copyfile(base / name, stage / name)
+    shutil.copytree(root / 'firmware/rtl_nic', stage / 'firmware/rtl_nic')
+    scripts = stage / 'scripts'
+    scripts.mkdir()
+    for name in ['check-router-deps','verify-image','flash-sd','image.py','policy.py','diag_profile.py','trace_profile.py']:
+        shutil.copyfile(root / 'scripts' / name,scripts / ('check-deps' if name=='check-router-deps' else name))
+    files=sorted(p for p in stage.rglob('*') if p.is_file())
+    (stage/'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.relative_to(stage)}\n' for p in files))
+    archive=base/'r5s-lan1-bringup-handoff.tar.gz'
+    with archive.open('wb') as raw, gzip.GzipFile(filename='',fileobj=raw,mode='wb',mtime=0) as gz, tarfile.open(fileobj=gz,mode='w') as bundle:
+        for path in sorted(p for p in stage.rglob('*') if p.is_file()):
+            info=bundle.gettarinfo(str(path),str(path.relative_to(stage.parent)))
+            info.uid=info.gid=info.mtime=0
+            info.uname=info.gname=''
+            with path.open('rb') as f: bundle.addfile(info,f)
+    (base/(archive.name+'.sha256')).write_text(f'{sha256(archive)}  {archive.name}\n')
+print(sha256(base / image),image)

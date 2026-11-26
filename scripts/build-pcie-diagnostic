@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import shutil
+import sys
+import xml.etree.ElementTree as ET
+
+import network_uboot as trace
+from image import assemble_files, verify
+from policy import sha256
+
+root = trace.ROOT
+base = Path(sys.argv[1]).resolve()
+base.mkdir(parents=True)
+(base / 'logs').mkdir()
+work = base / 'work'
+work.mkdir()
+profile = 'pcie-diagnostic'
+output = base / profile
+output.mkdir()
+sdk = root / 'out/native-net/work/microkit/release/microkit-sdk-2.4.0'
+board = sdk / 'board/nanopi_r5s_trace/debug'
+build = runpy.run_path(str(root / 'scripts/build-rawio-dma-restart'))['build_pd']
+build.__globals__['BASE'] = base
+os.environ['CARGO_TARGET_AARCH64_SEL4_RUSTFLAGS'] = f'--remap-path-prefix={base}=/r5s-pcie-diagnostic'
+shutil.copyfile(root / 'out/native-net/aarch64-sel4.json', base / 'aarch64-sel4.json')
+
+modules = ('mmio', 'pcie', 'mac', 'dma', 'phy', 'platform', 'provider', 'ring')
+for directory, elf, extra in [
+    ('pcie_provider', 'provider', {f'{m}.rs': root / f'drivers/rtl8125/{m}.rs' for m in modules}),
+    ('pcie_diagnostic', 'heartbeat', {f'{m}.rs': root / f'pds/network_supervisor/src/{m}.rs'
+                                    for m in ('fault_display', 'fault_timing')}),
+]:
+    shutil.copyfile(build(f'pds/{directory}', elf, sdk, extra=extra), output / f'{elf}.elf')
+
+mapping = (root / 'pds/pcie_provider/src/mapping.rs').read_text()
+windows = re.findall(r'\((0x[\da-f]+), (0x[\da-f]+), (0x[\da-f]+)\)', mapping)
+assert len(windows) == 20 and all(size == '0x1000' for _, _, size in windows)
+assert re.search(r'const STATUS: usize = 0x41000000;', mapping)
+system = ET.Element('system')
+for name, physical in [('gpio4', '0xfe770000'), ('trace_sync', None), ('pcie_status', None)] + [
+    (f'pcie_{i}', p) for i, (p, _, _) in enumerate(windows)
+]:
+    mr = ET.SubElement(system, 'memory_region', name=name, size='0x1000')
+    if physical:
+        mr.set('phys_addr', physical)
+
+for name, image, priority, budget, maps in [
+    ('heartbeat', 'heartbeat', '110', '100', [
+        ('gpio4', '0x40000000', 'rw', 'false'),
+        ('trace_sync', '0x40001000', 'rw', 'true'),
+        ('pcie_status', '0x41000000', 'r', 'true'),
+    ]),
+    ('pcie_provider', 'provider', '105', '700', [('pcie_status', '0x41000000', 'rw', 'true')] + [
+        (f'pcie_{i}', v, 'rw', 'false') for i, (_, v, _) in enumerate(windows)
+    ]),
+]:
+    pd = ET.SubElement(system, 'protection_domain', name=name, priority=priority, budget=budget, period='1000')
+    ET.SubElement(pd, 'program_image', path=f'{image}.elf')
+    for mr, va, perms, cached in maps:
+        ET.SubElement(pd, 'map', mr=mr, vaddr=va, perms=perms, cached=cached)
+ET.indent(system)
+ET.ElementTree(system).write(output / 'system.system', encoding='unicode')
+payload = output / 'loader.img'
+trace.run([sdk / 'bin/microkit', output / 'system.system', '--board', 'nanopi_r5s_trace',
+           '--config', 'debug', '--search-path', output, '-o', payload,
+           '-r', output / 'microkit-report.txt'], base / 'logs/microkit.log')
+for name in ('loader', 'sel4', 'initialiser', 'monitor'):
+    shutil.copyfile(board / f'elf/{name}.elf', output / f'{name}.elf')
+
+lock = json.loads((root / 'sources.lock').read_text())
+trace.clone_inputs(work, lock)
+trace.build_uboot(base, profile, payload, 0, runpy.run_path(str(root / 'scripts/build-native-net'))['early_header']())
+relative = 'microkit/build/nanopi_r5s_trace/debug/sel4/build/gen_headers/plat/machine/devices_gen.h'
+target = work / relative
+target.parent.mkdir(parents=True, exist_ok=True)
+shutil.copyfile(root / 'out/native-net/work' / relative, target)
+layout = trace.layout(base, sdk, payload, output / 'loader.elf', output,
+                      allowed_mmio=[int(p, 16) for p, _, _ in windows])
+(base / 'layout-report.json').write_text(json.dumps(layout, indent=2) + '\n')
+firmware = output / 'u-boot-rockchip.bin'
+policy = output / 'boot.txt'
+policy.write_text('PCIe discovery only. No bus mastering, RTL8125 DMA, packet services or routing. Hardware untested.\n')
+manifest = dict(format=7, profile=profile, hardware_tested=False, bus_master_enabled=False,
+                routing_enabled=False, load_address=0x30000000, ram=[0x20000000, 0x40000000],
+                loader=dict(size=payload.stat().st_size, sha256=sha256(payload)),
+                uboot=dict(size=firmware.stat().st_size, sha256=sha256(firmware)),
+                policy_sha256=sha256(policy), lock_sha256=sha256(root / 'sources.lock'), sources=lock['sources'])
+image = base / 'r5s-pcie-diagnostic.img'
+assemble_files(image, firmware, [(payload, 'loader.img'), (policy, 'boot.txt')], manifest,
+               sha256(payload) + sha256(firmware))
+assert verify(image) == manifest
+print(sha256(image))

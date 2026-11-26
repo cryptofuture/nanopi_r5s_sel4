@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+import hashlib,json,os,runpy,shutil,sys,subprocess
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import network_uboot as trace
+from image import assemble_files,verify
+from policy import sha256
+from diagnostics import SPEC
+ROOT=trace.ROOT;BASE=ROOT/'out/network-corrected/rawio'
+POOL=dict(virtual=0x60000000,physical=0x24000000,bus=0x24000000,size=0x40000,attributes='Normal-WB',alignment=4096)
+
+def build_pd(directory,name,sdk,raw=False,extra=None):
+ project=BASE/'work'/name
+ shutil.copytree(ROOT/directory,project,dirs_exist_ok=True,ignore=shutil.ignore_patterns('target'))
+ if extra:
+  for name,source in extra.items():shutil.copyfile(source,project/'src'/name)
+ path=project/'Cargo.toml';path.write_text(path.read_text().replace('../../vendor/rust-sel4/crates/sel4-microkit',str(ROOT/'vendor/rust-sel4/crates/sel4-microkit')).replace('../../vendor/rust-sel4/crates/sel4"',str(ROOT/'vendor/rust-sel4/crates/sel4')+'"').replace('../../router-core',str(ROOT/'router-core')))
+ args=['cargo','build','--manifest-path',path,'--release','--locked','-Zbuild-std=core,alloc,compiler_builtins','-Zbuild-std-features=compiler-builtins-mem','-Zjson-target-spec','--target',BASE/'aarch64-sel4.json']
+ if raw:args+=['--features','rawio']
+ trace.run(args,BASE/f'logs/{project.name}.log',env=dict(os.environ,SEL4_INCLUDE_DIRS=str(sdk/'board/nanopi_r5s_trace/debug/include'),R5S_PROJECT_ROOT=str(ROOT),CARGO_NET_OFFLINE='true'))
+ return project/'target/aarch64-sel4/release/r5s-heartbeat.elf'
+
+def main():
+ BASE.mkdir(parents=True,exist_ok=True);(BASE/'logs').mkdir(exist_ok=True);work=BASE/'work';work.mkdir(exist_ok=True)
+ prior=json.loads((ROOT/'out/gmac-bringup/ARTIFACTS.json').read_text())
+ preserved=dict(json.loads((ROOT/'out/preflight-iodomain-fix/preserved.json').read_text()));preserved['out/preflight-iodomain-fix/r5s-preflight-iodomain.img']='dd1147f7a41affd1b7be97de880e7ced7df474904ac8195ae7f11b1b839ff2a3';preserved['out/gmac-bringup/r5s-gmac-link.img']='9f829f2bb0afda78e753ca534777458943cae68c297f8bee315df87775ec7199'
+ for p,h in preserved.items():trace.require(sha256(ROOT/p)==h,'Preserved input changed: '+p)
+ source_paths=[]
+ for folder in ('drivers/gmac0','pds/gmac_dma_corrected','pds/gmac_probe','pds/network_supervisor','pds/net_probe'):
+  source_paths += [p for p in (ROOT/folder).rglob('*') if p.is_file() and 'target' not in p.parts and '__pycache__' not in p.parts]
+ source_paths += [ROOT/'scripts/image.py',ROOT/'scripts/dma_profile.py',ROOT/'scripts/handoff_trace.py',ROOT/'firmware/uboot-config',ROOT/'firmware/sd-only.dtsi',ROOT/'protocol/diagnostics-v2.json',Path(__file__).resolve(),ROOT/'firmware/vccio1-boot-policy.dtsi',ROOT/'scripts/network_uboot.py',ROOT/'scripts/iodomain_fixed_build.py',ROOT/'pds/preflight_fault_id/src/poll.c']
+ inputs={str(p.relative_to(ROOT)):sha256(p) for p in sorted(source_paths)}
+ identity=hashlib.sha256(json.dumps(inputs,sort_keys=True).encode()).hexdigest()[:32]
+ (BASE/'identity.rs').write_text('pub const BUILD_ID:[u8;16]=['+','.join(str(b) for b in bytes.fromhex(identity))+'];\n')
+ lock=json.loads((ROOT/'sources.lock').read_text());trace.clone_inputs(work,lock)
+ sdk=ROOT/'out/native-net/work/microkit/release/microkit-sdk-2.4.0'
+ shutil.copyfile(ROOT/'out/native-net/aarch64-sel4.json',BASE/'aarch64-sel4.json')
+ raw_super=ROOT/'pds/network_supervisor'
+ old=runpy.run_path(str(ROOT/'scripts/build-native-net'));layouts={};built={}
+ for profile,raw in [('gmac-rawio',True)]:
+  output=BASE/profile;output.mkdir(exist_ok=True)
+  driver=build_pd('pds/gmac_dma_corrected','driver-'+profile,sdk,raw)
+  shutil.copyfile(driver,output/'driver.elf')
+  if raw:
+   supervisor=build_pd(str(raw_super.relative_to(ROOT)),'raw-supervisor',sdk)
+   probe=build_pd('pds/gmac_probe','probe',sdk,extra={'queue.rs':ROOT/'pds/gmac_dma_corrected/src/queue.rs','probe.rs':ROOT/'pds/net_probe/src/lib.rs','identity.rs':BASE/'identity.rs'})
+   shutil.copyfile(probe,output/'probe.elf')
+  else:supervisor=ROOT/'out/gmac-bringup/supervisor.elf'
+  shutil.copyfile(supervisor,output/'heartbeat.elf');shutil.copyfile(ROOT/'out/native-net/health.elf',output/'health.elf')
+  xml=(ROOT/'out/gmac-bringup/system.system').read_text().replace('<system>','<system>\n<memory_region name="dma_pool" size="0x40000" phys_addr="0x24000000" />\n<memory_region name="queues" size="0x8000" />\n<memory_region name="probe_status" size="0x1000" />')
+  xml=xml.replace('<protection_domain name="gmac"','<protection_domain name="gmac"')
+  needle='<map mr="link_status" vaddr="0x40002000" perms="rw" cached="true" />'
+  xml=xml.replace(needle,needle+'\n<map mr="dma_pool" vaddr="0x60000000" perms="rw" cached="true" />'+ ('\n<map mr="queues" vaddr="0x61000000" perms="rw" cached="true" />' if raw else ''))
+  if raw:
+   xml=xml.replace('<map mr="dma_pool"', '<map mr="probe_status" vaddr="0x40004000" perms="r" cached="true" /><map mr="dma_pool"')
+   xml=xml.replace('<map mr="link_status" vaddr="0x40002000" perms="r" cached="true" /></protection_domain>','<map mr="link_status" vaddr="0x40002000" perms="r" cached="true" /><map mr="probe_status" vaddr="0x40004000" perms="r" cached="true" /></protection_domain>')
+   xml=xml.replace('</system>','''<protection_domain name="probe" priority="104" budget="200" period="1000"><program_image path="probe.elf" />
+<map mr="trace_sync" vaddr="0x40001000" perms="r" cached="true" /><map mr="link_status" vaddr="0x40002000" perms="r" cached="true" />
+<map mr="probe_status" vaddr="0x40004000" perms="rw" cached="true" /><map mr="queues" vaddr="0x61000000" perms="rw" cached="true" /></protection_domain></system>''')
+  (output/'system.system').write_text(xml)
+  board=sdk/'board/nanopi_r5s_trace/debug/elf'
+  for name in ('loader','sel4','initialiser','monitor'):
+   trace.require(sha256(board/f'{name}.elf')==sha256(ROOT/f'out/native-net/runtime-baseline-v2/{name}.elf'),'Runtime changed')
+   shutil.copyfile(board/f'{name}.elf',output/f'{name}.elf')
+  payload=output/'loader.img';trace.run([sdk/'bin/microkit',output/'system.system','--board','nanopi_r5s_trace','--config','debug','--search-path',output,'-o',payload,'-r',output/'microkit-report.txt'],BASE/f'logs/{profile}-microkit.log')
+  trace.build_uboot(BASE,profile,payload,0,old['early_header']())
+  relative='microkit/build/nanopi_r5s_trace/debug/sel4/build/gen_headers/plat/machine/devices_gen.h';target=work/relative;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/'out/native-net/work'/relative,target)
+  devices=[0xfe2a0000,0xfe2a1000,0xfdc60000,0xfdc20000,0xfdd20000,0xfdd00000,0xfdd60000]
+  layouts[profile]=trace.layout(BASE,sdk,payload,output/'loader.elf',output,allowed_mmio=devices)
+  for name,start,end in layouts[profile]['loader_regions']:
+   trace.require(not (POOL['physical']<end and start<POOL['physical']+POOL['size']),'DMA pool overlaps '+name)
+  objs=layouts[profile]['capdl_objects']
+  for addr in range(POOL['physical'],POOL['physical']+POOL['size'],4096):trace.require(sum(o['physical']==addr for o in objs)==1,f'Pool frame missing/overlapped: {addr:x}')
+  report=(output/'microkit-report.txt').read_text();trace.require("* Slot: 3\n\t\t\t-> Object: 'pud_gmac'" in report,'Own VSpace cap not installed')
+  policy=output/'boot.txt';policy.write_text(f'{profile}: real Rust own-VSpace cache calls, reserved Normal-WB pool.\n'+('Native DMA RX/TX with bench-only EtherType 0x88b5 test service. Fresh external ACK alone renews IO_VERIFIED for five seconds.\n' if raw else 'No DMA source object, descriptor OWN or start writes. READY includes cache preflight and real PHY link.\n')+'No runtime persistent storage writes. Hardware untested.\n')
+  uboot=output/'u-boot-rockchip.bin';m=dict(corrections=["vccio1-boot-policy","resolved-phy","bounded-startup","snapshot-before-time","cpu-owned-cache-exercise"],format=6,profile=profile,hardware_tested=False,dma_enabled=raw,ethernet_enabled=True,diagnostics=SPEC,pool=POOL,build_id=identity,patches_sha256=hashlib.sha256(json.dumps(inputs,sort_keys=True).encode()).hexdigest(),load_address=0x30000000,ram=[0x20000000,0x40000000],loader=dict(size=payload.stat().st_size,sha256=sha256(payload)),uboot=dict(size=uboot.stat().st_size,sha256=sha256(uboot)),policy_sha256=sha256(policy),lock_sha256=sha256(ROOT/'sources.lock'),sources=lock['sources'])
+  images=[BASE/f'r5s-{profile}{suffix}.img' for suffix in ('','.reproduced')]
+  for image in images:
+   if image.exists():trace.require(verify(image)==m,'Existing output differs; preserve it first')
+   else:assemble_files(image,uboot,[(payload,'loader.img'),(policy,'boot.txt')],m,sha256(payload)+sha256(uboot))
+  trace.require(sha256(images[0])==sha256(images[1]),'Assemblies differ');built[images[0].name]=sha256(images[0])
+ for p,h in inputs.items():trace.require(sha256(ROOT/p)==h,'Build input changed: '+p)
+ for p,h in preserved.items():trace.require(sha256(ROOT/p)==h,'Preserved artifact changed: '+p)
+ (BASE/'source-hashes.json').write_text(json.dumps(inputs,indent=2)+'\n');(BASE/'layout-report.json').write_text(json.dumps(layouts,indent=2)+'\n')
+ (BASE/'ARTIFACTS.json').write_text(json.dumps(dict(built=built,hardware_tested=False,preserved=preserved,build_id=identity,pool=POOL,assembly_reproducible=True),indent=2)+'\n')
+ (BASE/'SHA256SUMS').write_text(''.join(f'{v}  {k}\n' for k,v in built.items()));print(json.dumps(built))
+if __name__=='__main__':main()

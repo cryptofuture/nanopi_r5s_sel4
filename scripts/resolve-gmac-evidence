@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+import hashlib,json
+from pathlib import Path
+from fdt_evidence import Fdt,cells,text
+ROOT=Path(__file__).resolve().parents[1]
+base=ROOT/'out/gmac-bringup';capture=ROOT/'evidence/gmac-captured-1e089e3a/inner/gmac-evidence'
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def main():
+    dt=Fdt((capture/'runtime-original.dtb').read_bytes());root=dt.nodes['/']
+    if text(root['model'])!='FriendlyElec NanoPi R5S' or root['compatible'].split(b'\0')[:-1]!=[b'friendlyelec,nanopi-r5s',b'rockchip,rk3568']:raise ValueError('Board mismatch')
+    meta=json.loads((capture/'metadata.json').read_text());g=text(dt.nodes['/aliases']['ethernet0']);p=dt.nodes[g]
+    if g!='/ethernet@fe2a0000' or not meta['links']['device/of_node'].endswith(g) or 'version: 6.1.141' not in (capture/'driver.txt').read_text():raise ValueError('Interface/kernel mismatch')
+    phy=dt.resolve(cells(p['phy-handle'])[0]);phyid=int((capture/'mdio/stmmac-0:01-phy_id').read_text(),16)
+    if not phy.startswith(g+'/mdio/') or 'OF_FULLNAME='+phy not in (capture/'mdio/stmmac-0:01-uevent').read_text():raise ValueError('PHY identity mismatch')
+    if not meta['links']['phydev'].endswith('stmmac-0:01') or cells(dt.nodes[phy]['reg'])!=[1]:raise ValueError('MDIO mismatch')
+    ledger=[]
+    for prop,value in p.items():
+        if prop in ('phandle',):continue
+        try:decoded=text(value) if value and value[-1:]==b'\0' and all(32<=x<127 or x==0 for x in value) else cells(value)
+        except (ValueError,UnicodeDecodeError):decoded=value.hex()
+        ledger.append(dict(kind='captured',member='gmac-evidence/runtime-original.dtb',node=g,property=prop,value=decoded,source='locked U-Boot RK3568 EQoS/clock/pinctrl and RTL8211F references',intended_use='native link configuration',limitation='DT declaration, not native hardware validation'))
+    pins=[]
+    for ref in cells(p['pinctrl-0']):
+        path=dt.resolve(ref);v=cells(dt.nodes[path]['rockchip,pins'])
+        for i in range(0,len(v),4):
+            bank,pin,mux,cfg=v[i:i+4];config=dt.resolve(cfg)
+            pins.append(dict(node=path,bank=bank,pin=pin,mux=mux,config_node=config,config={k:cells(vv) for k,vv in dt.nodes[config].items() if k!='phandle'}))
+    reset=cells(p['snps,reset-gpio']);resetnode=dt.resolve(reset[0])
+    reserved=[]
+    for path,props in dt.nodes.items():
+        if path.startswith('/reserved-memory/') and 'reg' in props:
+            reserved += [dict(node=path,start=a,end=a+s,properties=list(props)) for a,s in dt.regs(path) if s]
+    excluded=dt.reservations+[[v['start'],v['end']] for v in reserved]+[[0,0x200000],[0x8400000,0x9400000],[0x10000000,0x10800000]]
+    for a,b in excluded:
+        if a<0x40000000 and b>0x20000000:raise ValueError('Captured reservation overlaps working RAM')
+    ancestors=[];node=g
+    while node:
+        props=dt.nodes[node];ancestors.append(dict(node=node,dma_ranges=props.get('dma-ranges',None).hex() if 'dma-ranges' in props else None,dma_coherent='dma-coherent' in props,ranges=props.get('ranges',None).hex() if 'ranges' in props else None));node=node.rsplit('/',1)[0] if node!='/' else ''
+        if not node and ancestors[-1]['node']!='/':node='/'
+    result=dict(archive_sha256=sha(ROOT/'r5s-gmac-evidence.tar.gz'),original_dtb_sha256=sha(capture/'runtime-original.dtb'),model=text(root['model']),compatible=text(root['compatible']).split('\0'),kernel='6.1.141 (ethtool driver version)',interface='eth0',mac_node=g,mmio=dt.regs(g),compatible_mac=text(p['compatible']).split('\0'),phy=dict(node=phy,address=1,id=phyid,mode=text(p['phy-mode'])),delay=dict(tx=cells(p['tx_delay'])[0],rx=cells(p['rx_delay'])[0],owner='MAC; disable PHY TX/RX delays'),reset=dict(node=resetnode,reg=dt.regs(resetnode),pin=reset[1],active_low=bool(reset[2]&1),timing_us=cells(p['snps,reset-delays-us'])),clocks=dt.refs(g,'clocks','#clock-cells'),assigned_clocks=dt.refs(g,'assigned-clocks','#clock-cells'),assigned_parents=dt.refs(g,'assigned-clock-parents','#clock-cells'),assigned_rates=cells(p['assigned-clock-rates']),resets=dt.refs(g,'resets','#reset-cells'),pins=pins,grf=dt.regs(dt.resolve(cells(p['rockchip,grf'])[0])),interrupts=cells(p['interrupts']),interrupt_parent=dt.resolve(cells(root['interrupt-parent'])[0]),root_cells=dict(address=cells(root['#address-cells'])[0],size=cells(root['#size-cells'])[0]),memory=[dict(start=a,end=a+s) for a,s in dt.regs('/memory') if s],fdt_reservations=dt.reservations,reserved_memory=reserved,dma_ancestors=ancestors,phy_supply='not declared on captured MAC or PHY; no regulator/voltage writes permitted',ledger=ledger,unknown=['actual MAC_VERSION register until native read','GMAC DMA bus translation/coherency and cache operations not hardware tested','physical jack position not encoded by DT'],enabled_nodes=[n for n,v in dt.nodes.items() if text(v.get('status',b'okay')) in ('ok','okay')])
+    result['providers']={name:dict(node=path,reg=dt.regs(path)) for name,path in {'cru':result['clocks'][0]['node'],'pmucru':'/clock-controller@fdd00000','pmugrf':dt.resolve(cells(dt.nodes['/pinctrl']['rockchip,pmu'])[0])}.items()}
+    result['clock_direction']=text(p['clock_in_out'])
+    result['io_supplies']=[]
+    for prop,value in dt.nodes['/syscon@fdc20000/io-domains'].items():
+        if not prop.endswith('-supply'):continue
+        node=dt.resolve(cells(value)[0]);props=dt.nodes[node]
+        result['io_supplies'].append(dict(property=prop,node=node,name=text(props['regulator-name']),minimum=cells(props['regulator-min-microvolt'])[0] if 'regulator-min-microvolt' in props else None,maximum=cells(props['regulator-max-microvolt'])[0] if 'regulator-max-microvolt' in props else None,always_on='regulator-always-on' in props,boot_on='regulator-boot-on' in props))
+    (base/'gmac0-resolved.json').write_text(json.dumps(result,indent=2)+'\n')
+    outer=json.loads((base/'evidence-index.json').read_text());outer['nested']=json.loads((base/'evidence-inner-index.json').read_text());outer['collector_version']='not embedded; metadata schema agrees with prior collector';outer['errors']={'dtc_warnings_bytes':(capture/'dtc.log').stat().st_size,'empty_driver_fields':['firmware-version','expansion-rom-version','bus-info']};outer['original_fdt']=True
+    for line in (capture/'SHA256SUMS').read_text().splitlines():
+        digest,name=line.split('  ',1);path=capture/name
+        if not path.resolve().is_relative_to(capture.resolve()) or not path.is_file() or sha(path)!=digest:raise ValueError('Captured checksum mismatch: '+name)
+    outer['inner_checksums_verified']=True
+    (base/'evidence-index.json').write_text(json.dumps(outer,indent=2)+'\n')
+if __name__=='__main__':main()

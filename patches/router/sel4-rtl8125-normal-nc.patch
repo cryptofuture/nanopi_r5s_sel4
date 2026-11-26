@@ -1,0 +1,71 @@
+--- a/src/arch/arm/64/kernel/vspace.c
++++ b/src/arch/arm/64/kernel/vspace.c
+@@ -74,6 +74,11 @@
+  */
+ 
+ #define SMP_SHARE   3
++
++/* Keep the EL2 direct map and the RTL8125 descriptor mappings consistent. */
++#define R5S_DESC_BASE 0x24200000ul
++#define R5S_DESC_END  (R5S_DESC_BASE + 2 * BIT(seL4_LargePageBits))
++#define OUTER_SHAREABLE 2
+ 
+ struct lookupPTSlot_ret {
+     pte_t *ptSlot;
+@@ -364,9 +369,9 @@
+                                                                                                                         paddr,
+                                                                                                                         0,                        /* global */
+                                                                                                                         1,                        /* access flag */
+-                                                                                                                        SMP_TERNARY(SMP_SHARE, 0),        /* Inner-shareable if SMP enabled, otherwise unshared */
++                                                                                                                        paddr == R5S_DESC_BASE || paddr == R5S_DESC_BASE + BIT(seL4_LargePageBits) ? OUTER_SHAREABLE : SMP_TERNARY(SMP_SHARE, 0),
+                                                                                                                         0,                        /* VMKernelOnly */
+-                                                                                                                        NORMAL
++                                                                                                                        paddr == R5S_DESC_BASE || paddr == R5S_DESC_BASE + BIT(seL4_LargePageBits) ? NORMAL_NC : NORMAL
+                                                                                                                     );
+         vaddr += BIT(seL4_LargePageBits);
+     }
+@@ -804,6 +809,15 @@
+ 
+     /* Inner-shareable if SMP enabled, otherwise unshared (ignored for devices) */
+     word_t shareable = cacheable ? SMP_TERNARY(SMP_SHARE, 0) : 0;
++
++    if (paddr >= R5S_DESC_BASE && paddr < R5S_DESC_END) {
++#ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
++        attridx = S2_NORMAL_INNER_NC_OUTER_NC;
++#else
++        attridx = NORMAL_NC;
++#endif
++        shareable = OUTER_SHAREABLE;
++    }
+ 
+     if (page_size == ARMSmallPage) {
+         return pte_pte_4k_page_new(nonexecutable, paddr, nG, 1 /* access flag */,
+@@ -1705,6 +1719,16 @@
+ 
+         base = pptr_to_paddr((void *)cap_frame_cap_get_capFBasePtr(cap));
+ 
++        if (base < R5S_DESC_END &&
++            base + BIT(pageBitsForSize(frameSize)) > R5S_DESC_BASE &&
++            (frameSize != ARMSmallPage || cap_frame_cap_get_capFIsDevice(cap) ||
++             vm_attributes_get_armPageCacheable(attributes) ||
++             !vm_attributes_get_armExecuteNever(attributes))) {
++            current_syscall_error.type = seL4_InvalidArgument;
++            current_syscall_error.invalidArgumentNumber = 2;
++            return EXCEPTION_SYSCALL_ERROR;
++        }
++
+         lookupPTSlot_ret_t lu_ret = lookupPTSlot(vspaceRoot, vaddr);
+         if (unlikely(lu_ret.ptBitsLeft != pageBitsForSize(frameSize))) {
+             current_lookup_fault = lookup_fault_missing_capability_new(lu_ret.ptBitsLeft);
+@@ -2101,6 +2125,11 @@
+ 
+     frame_pptr = cap_frame_cap_get_capFBasePtr(lu_ret.cap);
+ 
++    if (pptr_to_paddr((void *)frame_pptr) == R5S_DESC_BASE) {
++        current_fault = seL4_Fault_CapFault_new(frame_cptr, false);
++        return EXCEPTION_FAULT;
++    }
++
+     ksUserLogBuffer = pptr_to_paddr((void *) frame_pptr);
+ 
+     *armKSGlobalLogPTE = pte_pte_page_new(

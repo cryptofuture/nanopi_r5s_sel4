@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+import hashlib,inspect,json,os,runpy,shutil,subprocess,sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import handoff_trace as trace
+from diagnostics import SPEC
+from image import assemble_files,verify
+from policy import sha256
+ROOT=trace.ROOT;BASE=ROOT/'out/gmac-bringup';PROFILE='gmac-link'
+MMIO=[('gmac',0xfe2a0000,0x2000,0x50000000),('grf',0xfdc60000,4096,0x50002000),('pmugrf',0xfdc20000,4096,0x50003000),('cru',0xfdd20000,4096,0x50004000),('pmucru',0xfdd00000,4096,0x50005000),('gpio0',0xfdd60000,4096,0x50006000)]
+
+def build_pd(name,sdk):
+    source=ROOT/('pds/gmac_supervisor' if name=='supervisor' else 'pds/gmac_link')
+    project=BASE/'work'/name
+    shutil.copytree(source,project,dirs_exist_ok=True,ignore=shutil.ignore_patterns('target'))
+    path=project/'Cargo.toml';path.write_text(path.read_text().replace('../../vendor/rust-sel4/crates/sel4-microkit',str(ROOT/'vendor/rust-sel4/crates/sel4-microkit')))
+    env=dict(os.environ,SEL4_INCLUDE_DIRS=str(sdk/'board/nanopi_r5s_trace/debug/include'),R5S_PROJECT_ROOT=str(ROOT),CARGO_NET_OFFLINE='true')
+    trace.run(['cargo','build','--manifest-path',path,'--release','--locked','-Zbuild-std=core,alloc,compiler_builtins','-Zbuild-std-features=compiler-builtins-mem','-Zjson-target-spec','--target',BASE/'aarch64-sel4.json'],BASE/f'logs/{name}.log',env=env)
+    shutil.copyfile(project/'target/aarch64-sel4/release/r5s-heartbeat.elf',BASE/f'{name}.elf')
+
+def main():
+    def source_inputs():
+        paths=[ROOT/'sources.lock',ROOT/'protocol/diagnostics-v2.json']
+        for directory in ('drivers/gmac0','pds/gmac_link','pds/gmac_supervisor'):
+            paths.extend(p for p in (ROOT/directory).rglob('*') if p.is_file() and 'target' not in p.parts and '__pycache__' not in p.parts)
+        paths.extend(ROOT/'scripts'/name for name in ('build-gmac-bringup','generate-gmac-config','gmac_profile.py','image.py','handoff_trace.py'))
+        return {str(p.relative_to(ROOT)):sha256(p) for p in sorted(paths)}
+    inputs=source_inputs()
+    old=runpy.run_path(str(ROOT/'scripts/build-native-net'))
+    preserved={**old['PRESERVED'],'out/native-net/r5s-runtime-baseline-v2.img':'6490d1d3bcf8c205b408b5e47911151f07521feef1b161942b65c043b3936ade'}
+    for path,digest in preserved.items():trace.require(sha256(ROOT/path)==digest,'Preserved input changed: '+path)
+    resolved=json.loads((BASE/'gmac0-resolved.json').read_text())
+    trace.require(resolved['archive_sha256']==sha256(ROOT/'r5s-gmac-evidence.tar.gz'),'Evidence changed')
+    for a,b in resolved['fdt_reservations']+[[v['start'],v['end']] for v in resolved['reserved_memory']]:
+        trace.require(not (a<0x40000000 and b>0x20000000),'Captured reservation intersects working RAM')
+    work=BASE/'work';work.mkdir(exist_ok=True)
+    lock=json.loads((ROOT/'sources.lock').read_text());trace.clone_inputs(work,lock)
+    sdk=ROOT/'out/native-net/work/microkit/release/microkit-sdk-2.4.0'
+    shutil.copyfile(ROOT/'vendor/rust-sel4/support/targets/aarch64-sel4.json',BASE/'aarch64-sel4.json')
+    trace.require((ROOT/'pds/gmac_supervisor/src/display.rs').read_bytes()==(ROOT/'pds/diagnostics/src/display.rs').read_bytes(),'Diagnostics specification drift')
+    for name in ('supervisor','driver'):build_pd(name,sdk)
+    shutil.copyfile(BASE/'supervisor.elf',BASE/'heartbeat.elf')
+    shutil.copyfile(ROOT/'out/native-net/health.elf',BASE/'health.elf')
+    xml='<system>\n<memory_region name="gpio4" size="0x1000" phys_addr="0xfe770000" />\n<memory_region name="trace_sync" size="0x1000" />\n<memory_region name="link_status" size="0x1000" />\n'
+    for name,phys,size,va in MMIO:xml+=f'<memory_region name="{name}" phys_addr="0x{phys:x}" size="0x{size:x}" />\n'
+    xml+='''<protection_domain name="heartbeat" priority="110" budget="100" period="1000"><program_image path="heartbeat.elf" />
+<map mr="gpio4" vaddr="0x40000000" perms="rw" cached="false" />
+<map mr="trace_sync" vaddr="0x40001000" perms="rw" cached="true" />
+<map mr="link_status" vaddr="0x40002000" perms="r" cached="true" /></protection_domain>
+<protection_domain name="health" priority="100" budget="100" period="1000"><program_image path="health.elf" />
+<map mr="trace_sync" vaddr="0x40001000" perms="rw" cached="true" /></protection_domain>
+<protection_domain name="gmac" priority="105" budget="200" period="1000"><program_image path="driver.elf" />
+<map mr="trace_sync" vaddr="0x40001000" perms="r" cached="true" />
+<map mr="link_status" vaddr="0x40002000" perms="rw" cached="true" />
+'''
+    for name,phys,size,va in MMIO:xml+=f'<map mr="{name}" vaddr="0x{va:x}" perms="rw" cached="false" />\n'
+    xml+='</protection_domain></system>\n';(BASE/'system.system').write_text(xml)
+    output=BASE/PROFILE;output.mkdir(exist_ok=True);board=sdk/'board/nanopi_r5s_trace/debug/elf'
+    for name in ('loader','sel4','initialiser','monitor'):
+        trace.require(sha256(board/f'{name}.elf')==sha256(ROOT/f'out/native-net/runtime-baseline-v2/{name}.elf'),'Proven runtime component changed: '+name)
+        shutil.copyfile(board/f'{name}.elf',output/f'{name}.elf')
+    payload=output/'loader.img'
+    trace.run([sdk/'bin/microkit',BASE/'system.system','--board','nanopi_r5s_trace','--config','debug','--search-path',BASE,'-o',payload,'-r',output/'microkit-report.txt'],BASE/'logs/microkit.log')
+    trace.build_uboot(BASE,PROFILE,payload,0,old['early_header']())
+    relative='microkit/build/nanopi_r5s_trace/debug/sel4/build/gen_headers/plat/machine/devices_gen.h'
+    target=work/relative;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/'out/native-net/work'/relative,target)
+    allowed=[phys+offset for _,phys,size,_ in MMIO for offset in range(0,size,4096)]
+    report=trace.layout(BASE,sdk,payload,output/'loader.elf',output,allowed_mmio=allowed)
+    for phys in allowed:trace.require(sum(o['physical']==phys for o in report['capdl_objects'])==1,f'MMIO frame allocation not unique: {phys:x}')
+    report.update(captured_reservations=resolved['fdt_reservations'],reserved_memory=resolved['reserved_memory'],flattened_dt_reservations='Original captured DTB parsed and reconciled; no overlap with working RAM',link_mmio=[dict(name=name,physical=phys,virtual=va,size=size,attributes='Device-nGnRnE',owner='gmac') for name,phys,size,va in MMIO],scheduling={'heartbeat':[110,100,1000],'gmac':[105,200,1000],'health':[100,100,1000]},dma_areas=[])
+    (BASE/'layout-report.json').write_text(json.dumps(report,indent=2)+'\n')
+    patches=BASE/'patches';patches.mkdir(exist_ok=True)
+    paths=['scripts/build-gmac-bringup','scripts/generate-gmac-config','scripts/gmac_evidence.py','scripts/fdt_evidence.py','scripts/resolve-gmac-evidence','scripts/gmac_profile.py','scripts/image.py','scripts/handoff_trace.py']
+    paths += [str(p.relative_to(ROOT)) for dirname in ('drivers/gmac0','pds/gmac_link','pds/gmac_supervisor') for p in sorted((ROOT/dirname).rglob('*')) if p.is_file() and 'target' not in p.parts and '__pycache__' not in p.parts]
+    for name in paths:
+        dest=patches/name;dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/name,dest)
+    shutil.copytree(ROOT/'out/native-net/patches',patches/'preserved-runtime',dirs_exist_ok=True)
+    patch_hash=hashlib.sha256(b''.join(p.read_bytes() for p in sorted(patches.rglob('*')) if p.is_file())).hexdigest()
+    trace.require(source_inputs()==inputs,'Source changed during build; do not package this build')
+    (BASE/'source-hashes.json').write_text(json.dumps(inputs,indent=2)+'\n')
+    policy=output/'boot.txt';policy.write_text('Native GMAC0/RTL8211F link-only. No descriptor rings or DMA start.\nWAIT: initialising/no cable; READY: fresh valid link and health; FAULT: terminal check or stale service.\nNo IO_VERIFIED in this image. No runtime storage writes.\n')
+    uboot=output/'u-boot-rockchip.bin'
+    manifest=dict(format=5,profile=PROFILE,hardware_tested=False,dma_enabled=False,ethernet_enabled=True,diagnostics=SPEC,dma_guard='MAC RE/TE, DMA ST/SR and descriptor-base readback zero; write whitelist',evidence_sha256=resolved['archive_sha256'],patches_sha256=patch_hash,load_address=0x30000000,ram=[0x20000000,0x40000000],loader=dict(size=payload.stat().st_size,sha256=sha256(payload)),uboot=dict(size=uboot.stat().st_size,sha256=sha256(uboot)),policy_sha256=sha256(policy),lock_sha256=sha256(ROOT/'sources.lock'),sources=lock['sources'])
+    seed=sha256(payload)+sha256(uboot);images=[BASE/f'r5s-gmac-link{s}.img' for s in ('','.reproduced')]
+    for image in images:
+        if image.exists():trace.require(verify(image)==manifest,'Existing image differs; preserve it before rebuilding')
+        else:assemble_files(image,uboot,[(payload,'loader.img'),(policy,'boot.txt')],manifest,seed)
+    trace.require(sha256(images[0])==sha256(images[1]),'Assemblies differ')
+    (BASE/'SHA256SUMS').write_text(f'{sha256(images[0])}  {images[0].name}\n')
+    (BASE/'ARTIFACTS.json').write_text(json.dumps(dict(built={images[0].name:sha256(images[0])},hardware_tested=False,preserved=preserved,assembly_reproducible=True,kernel_sdk_changed=False,rawio='WITHHELD: cached descriptor ownership/cache-maintenance integration not qualified'),indent=2)+'\n')
+    for path,digest in preserved.items():trace.require(sha256(ROOT/path)==digest,'Preserved input changed: '+path)
+    print(images[0],sha256(images[0]))
+if __name__=='__main__':main()

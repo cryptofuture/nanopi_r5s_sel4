@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+"""Link the LAN1 provider and fixed pool with the working WAN protection domains."""
+from functools import partial
+import json
+import os
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import network_uboot as trace
+from policy import sha256
+from fdt_evidence import Fdt
+from dual_lan_profile import SMP_SCHEDULES, WORKER_SCHEDULES, b51_memory, b51_rx_fits, zc_pool_manifest, optimization_options, STAGES, ROUTER_SCHEDULE, dns_option, fallback_option, configure_schedule, scheduling_profile
+
+root = trace.ROOT
+dest = Path(sys.argv[1]).resolve()
+repair_modes = {"--repair=wan": 0, "--repair=lan1": 1, "--repair=lan2": 2, "--repair=both": 3}
+repair = repair_modes.get(sys.argv[2]) if len(sys.argv) == 3 else None
+stage = os.environ.get('R5S_DUAL_LAN_STAGE')
+if stage and (stage not in STAGES or repair != repair_modes['--repair=' + STAGES[stage]]):
+    sys.exit('Stage and port selection disagree')
+mask = repair if stage else 0
+logical = bool(stage and stage != 'lan2-tx')
+routing = stage == 'dual-lan-router'
+schedule = scheduling_profile(stage)
+workers = schedule in WORKER_SCHEDULES
+smp = schedule in SMP_SCHEDULES
+options = optimization_options()
+if options.get("R5S_TSO_TEST_SOFTWARE") == "1" and (
+        not routing or os.environ.get("R5S_TSO_TEST") != "1"
+        or not any(os.environ.get(f"R5S_{port}_TSO") == "1" for port in ("WAN", "LAN1", "LAN2"))):
+    sys.exit("Software TSO probe mode requires a router TSO test image")
+ring = options.get("R5S_B51_RING", "64")
+rx_queues = int(options.get("R5S_B51_RX_QUEUES", "1"))
+wide_ring = ring in ("256", "512")
+pool_size = zc_pool_manifest(options)["size"]
+lan1, lan2, shared_pool = b51_memory(ring, options.get("R5S_ZC_CACHE", "nc"), pool_size // 2048)
+shared_pa, _, _, padding_pa = shared_pool
+nc_end = padding_pa + 0x100000
+if wide_ring and not workers:
+    sys.exit("256/512-slot rings require the SMP router worker layout")
+if rx_queues > 1 and (not workers or not b51_rx_fits(ring, str(rx_queues))):
+    sys.exit("RSS requires an SMP worker schedule and ring sizes that fit LAN DMA RAM")
+if options.get("R5S_B51_DMA_BARRIERS") == "outer" and not workers:
+    sys.exit("Outer-shareable DMA barriers require the SMP router Normal-NC layout")
+if options.get("R5S_QUEUE_PAD") == "1" and not routing:
+    sys.exit("Padded queues require rebuilding the complete router")
+zero_copy = workers and options.get("R5S_ZERO_COPY") != "0"
+gmac_nc = options.get("R5S_GMAC_DMA_CACHE") == "nc"
+if gmac_nc and (not zero_copy or not wide_ring or options.get("R5S_GMAC_RING") != "256"):
+    sys.exit("Normal-NC GMAC DMA requires the SMP 256-slot GMAC and wide LAN ring layout")
+gmac_start = 0x24000000
+gmac_end = 0x24200000 if gmac_nc else 0x24100000
+writeback = options.get("R5S_ZC_CACHE") == "writeback"
+if (writeback or "R5S_ZC_POOL_BUFFERS" in options) and not zero_copy:
+    sys.exit("Write-back payloads require SMP zero-copy")
+if options.get("R5S_GMAC_RX_CHANNELS") == "2" and not zero_copy:
+    sys.exit("Two GMAC RX channels require SMP zero-copy")
+if options.get("R5S_GMAC_TX_CHANNELS") == "2" and (
+        not zero_copy or options.get("R5S_WORKER_WAN_EGRESS") != "1"):
+    sys.exit("Two GMAC TX channels require direct worker WAN egress")
+pool_cached = str(writeback).lower()
+tx_queues = int(options.get("R5S_B51_TX_QUEUES", "1"))
+if tx_queues == 2 and (not zero_copy or options.get("R5S_WORKER_LAN_EGRESS") != "1"
+        or not b51_rx_fits(ring, str(rx_queues), tx_queues)):
+    sys.exit("Two B51 TX queues require direct worker LAN egress and sufficient private DMA memory")
+
+fast_wan = options.get("R5S_WAN_FAST_PATH") == "1"
+fast_lan = options.get("R5S_LAN_FAST_PATH") == "1"
+worker_egress = options.get("R5S_WORKER_WAN_EGRESS") == "1"
+worker_lan_egress = options.get("R5S_WORKER_LAN_EGRESS") == "1"
+hybrid_irq = options.get("R5S_GMAC_HYBRID_IRQ") == "1"
+if options.get("R5S_GMAC_WORKER_TX") == "1" and not (hybrid_irq and fast_wan and worker_egress):
+    sys.exit("GMAC worker TX wakeups require hybrid mode and both direct WAN paths")
+if hybrid_irq and not workers:
+    sys.exit("GMAC hybrid IRQ requires an SMP router worker schedule")
+if options.get('R5S_SDK_CONFIG') == 'benchmark' and (not workers or os.environ.get('R5S_LAN_B51_UDP') != '1'):
+    sys.exit('The benchmark SDK requires workers and LAN status')
+if (fast_wan or fast_lan) and not zero_copy:
+    sys.exit("Direct ingress requires a worker schedule with zero-copy queues")
+if (worker_egress or worker_lan_egress) and not zero_copy:
+    sys.exit("Direct worker egress requires zero-copy workers")
+sdk_config = options.get("R5S_SDK_CONFIG", "debug")
+if sdk_config != "debug" and not smp:
+    sys.exit("A non-debug SDK requires an SMP router schedule")
+lan_b51_udp = os.environ.get('R5S_LAN_B51_UDP') == '1'
+if lan_b51_udp and not routing:
+    sys.exit('LAN B51 status requires the dual-lan-router checkpoint')
+# Production flavor gates: R5S_FIRMWARE_LOG=1 drops the 'quiet' feature (debug
+# logging on); R5S_LED_FAULTS=0 suppresses supervisor fault-code LED patterns.
+firmware_log = os.environ.get('R5S_FIRMWARE_LOG') == '1'
+led_faults = os.environ.get('R5S_LED_FAULTS', '1') != '0'
+quiet_feature = () if firmware_log else ('quiet',)
+queue = root / 'pds/gmac_dma_corrected/src/queue.rs'
+zc = root / 'pds/gmac_dma_corrected/src/zc.rs'
+tso = root / 'pds/gmac_dma_corrected/src/tso.rs'
+tso_testgen = root / 'pds/gmac_dma_corrected/src/tso_testgen.rs'
+tso_wan = os.environ.get('R5S_WAN_TSO') == '1'
+tso_ports = [name for name in ('lan1', 'lan2') if os.environ.get(f'R5S_{name.upper()}_TSO') == '1']
+gro = options.get("R5S_GRO") == "1"
+worker_gro = options.get("R5S_WORKER_GRO") == "1"
+driver_gro = options.get("R5S_DRIVER_GRO") == "1"
+if worker_gro and not zero_copy:
+    sys.exit("Worker GRO requires zero-copy workers")
+if driver_gro and not (zero_copy and (fast_wan or fast_lan)):
+    sys.exit("Driver GRO requires direct zero-copy ingress")
+if gro and (not tso_wan or len(tso_ports) != 2):
+    sys.exit("GRO requires the TSO group receiver on each port")
+if (tso_wan or tso_ports) and not zero_copy:
+    sys.exit('TSO requires the multicore zero-copy build')
+
+dual = sys.argv[2:] == ["--lan-dhcp"] or repair is not None
+dest.mkdir(parents=True)
+(dest / 'logs').mkdir()
+wan = root / 'out/router-wan-dhcp-repair/build-d/wan-dhcp'
+sdk = root / 'out/router-integrated/nc-kernel-f/mapping-check/sdk'
+if smp:
+    work = dest / 'work'
+    trace.clone_inputs(work, json.loads((root / 'sources.lock').read_text()))
+    trace.instrument(work, 0)
+    if sdk_config != 'debug':
+        trace.replace(work / 'microkit/tool/microkit/src/loader.rs',
+                      "        let mut boot_lvl2_lower: [u8; PAGE_TABLE_SIZE] = [0; PAGE_TABLE_SIZE];",
+                      "        let gpio_block = aarch64::block_descriptor(1, 0xfe77_0000, MT_DEVICE_nGnRnE);\n"
+                      "        let gpio_idx = 8 * aarch64::lvl1_index(0xfe77_0000);\n"
+                      "        boot_lvl1_lower[gpio_idx..gpio_idx + 8].copy_from_slice(&gpio_block.to_le_bytes());\n"
+                      "        let mut boot_lvl2_lower: [u8; PAGE_TABLE_SIZE] = [0; PAGE_TABLE_SIZE];")
+    if sdk_config == 'benchmark':
+        sel4 = work / 'sel4'
+        for name, anchor, declaration in (
+            ('include/model/statedata.h', 'NODE_STATE_DECLARE(timestamp_t, benchmark_kernel_number_schedules);',
+             'NODE_STATE_DECLARE(uint64_t, r5s_budget_exhaustions);'),
+            ('src/model/statedata.c', 'UP_STATE_DEFINE(timestamp_t, benchmark_kernel_number_schedules);',
+             'UP_STATE_DEFINE(uint64_t, r5s_budget_exhaustions);'),
+            ('src/benchmark/benchmark.c', '    NODE_STATE(benchmark_kernel_number_schedules) = 1;',
+             '    NODE_STATE(r5s_budget_exhaustions) = 0;'),
+            ('src/benchmark/benchmark_utilisation.c',
+             '    buffer[BENCHMARK_TOTAL_NUMBER_KERNEL_ENTRIES] = NODE_STATE(benchmark_kernel_number_entries);',
+             '    buffer[13] = NODE_STATE(r5s_budget_exhaustions);'),
+            ('src/kernel/thread.c', '        /* postpone until ready */\n        postpone(NODE_STATE(ksCurSC));',
+             '        if (NODE_STATE(benchmark_log_utilisation_enabled)) { NODE_STATE(r5s_budget_exhaustions)++; }'),
+        ):
+            if name == 'src/kernel/thread.c':
+                trace.replace(sel4 / name, anchor, declaration + '\n' + anchor)
+            else:
+                trace.replace(sel4 / name, anchor, anchor + '\n' + declaration)
+    loader = work / 'microkit/loader/src'
+    trace.replace(loader / 'loader.c', '    r5s_checkpoint(5);',
+                  '    if (logical_cpu == 0) { r5s_checkpoint(5); }')
+    trace.replace(loader / 'aarch64/cpus.c', '#elif defined(CONFIG_PLAT_ROCKPRO64)',
+                  '#elif defined(CONFIG_PLAT_RK3568)\n'
+                  'static const size_t psci_target_cpus[4] = {0x000, 0x100, 0x200, 0x300};\n'
+                  '#elif defined(CONFIG_PLAT_ROCKPRO64)')
+    with (root / 'patches/router/sel4-rtl8125-normal-nc.patch').open('rb') as patch:
+        subprocess.run(['patch', '--batch', '--fuzz=0', '-p1'], cwd=work / 'sel4', stdin=patch, check=True)
+    if wide_ring or writeback:
+        vspace = work / 'sel4/src/arch/arm/64/kernel/vspace.c'
+        trace.replace(vspace, '(R5S_DESC_BASE + 2 * BIT(seL4_LargePageBits))', hex(shared_pa if writeback else nc_end) + 'ul')
+        if gmac_nc:
+            trace.replace(vspace, '#define R5S_DESC_BASE 0x24200000ul',
+                          f'#define R5S_DESC_BASE {gmac_start:#x}ul')
+        source = vspace.read_text()
+        old = 'paddr == R5S_DESC_BASE || paddr == R5S_DESC_BASE + BIT(seL4_LargePageBits)'
+        direct = 'paddr >= R5S_DESC_BASE && paddr < R5S_DESC_END'
+        if source.count(old) != 2:
+            sys.exit('Unexpected Normal-NC direct-map patch')
+        vspace.write_text(source.replace(old, direct))
+        if writeback and wide_ring:
+            second_start = hex(lan2[1]) + 'ul'
+            end = hex(nc_end) + 'ul'
+            both = f'(({direct}) || (paddr >= R5S_DESC2_BASE && paddr < R5S_DESC2_END))'
+            trace.replace(vspace, '#define OUTER_SHAREABLE 2',
+                          f'#define R5S_DESC2_BASE {second_start}\n#define R5S_DESC2_END {end}\n#define OUTER_SHAREABLE 2')
+            source = vspace.read_text().replace(direct, both)
+            vspace.write_text(source)
+            overlap = 'base < R5S_DESC_END &&\n            base + BIT(pageBitsForSize(frameSize)) > R5S_DESC_BASE'
+            trace.replace(vspace, overlap,
+                          f'(({overlap}) || (base < R5S_DESC2_END &&\n'
+                          '            base + BIT(pageBitsForSize(frameSize)) > R5S_DESC2_BASE))')
+            direct = both
+        trace.replace(vspace, '    if (pptr_to_paddr((void *)frame_pptr) == R5S_DESC_BASE) {',
+                      '    paddr_t paddr = pptr_to_paddr((void *)frame_pptr);\n'
+                      f'    if ({direct}) {{')
+
+    trace.run([sys.executable, root / 'scripts/build-trace-sdk', work, '--r5s-smp', '--config', sdk_config],
+              dest / 'logs/sdk.log')
+    sdk = work / 'microkit/release/microkit-sdk-2.4.0'
+kernel = sdk / f'board/nanopi_r5s_trace/{sdk_config}/elf/sel4.elf'
+if not smp and sha256(kernel) != 'f8e01a56ff62d97a5d86b6486aeb4a251fd8561dc07043c4d21f3d549097d3ec':
+    sys.exit('Unexpected Normal-NC kernel')
+firmware = root / 'firmware/rtl_nic/rtl8125b-2.fw'
+if sha256(firmware) != '529bf1c25c97ff52b401090d00ff89cc22351012336e5a0c9662728a3ee909ef':
+    sys.exit('B51 firmware checksum mismatch')
+fdt = Fdt((root / 'evidence/gmac-captured-1e089e3a/inner/gmac-evidence/runtime-original.dtb').read_bytes())
+banks = [extent for path, props in fdt.nodes.items() if props.get('device_type') == b'memory\0'
+         for extent in fdt.regs(path)]
+if not any(pa <= lan1[1] and pa + size >= nc_end for pa, size in banks):
+    sys.exit('Normal-NC block outside captured DRAM')
+reserved = list(fdt.reservations)
+for path, props in fdt.nodes.items():
+    if path.startswith('/reserved-memory/') and 'reg' in props:
+        reserved.extend((pa, pa + size) for pa, size in fdt.regs(path) if size)
+if any(lo < nc_end and hi > lan1[1] for lo, hi in reserved):
+    sys.exit('LAN1 allocation overlaps a board reservation')
+os.environ['CARGO_TARGET_AARCH64_SEL4_RUSTFLAGS'] = f'--remap-path-prefix={dest}=/lan1'
+if smp:
+    sysroot = subprocess.check_output(['rustc', '--print', 'sysroot'], text=True).strip()
+    os.environ['CARGO_TARGET_AARCH64_SEL4_RUSTFLAGS'] += f' --remap-path-prefix={sysroot}=/rust-toolchain'
+if options.get("R5S_A55_OPT") == "1":
+    os.environ['CARGO_TARGET_AARCH64_SEL4_RUSTFLAGS'] += ' -C target-cpu=cortex-a55'
+    os.environ['CARGO_PROFILE_RELEASE_OPT_LEVEL'] = '3'
+    os.environ['CARGO_PROFILE_RELEASE_CODEGEN_UNITS'] = '1'
+shutil.copyfile(root / 'out/native-net/aarch64-sel4.json', dest / 'aarch64-sel4.json')
+build = runpy.run_path(str(root / 'scripts/build-rawio-dma-restart'))['build_pd']
+build.__globals__['BASE'] = dest
+build = partial(build, target=dest / 'work/pd-target')
+modules = {p.name: p for p in (root / 'drivers/rtl8125').glob('*.rs') if p.name != 'lib.rs'}
+mapping = (root / 'pds/pcie_provider/src/mapping.rs').read_text()
+windows = []
+for pa, va, size in re.findall(r'\((0x[\da-f]+), (0x[\da-f]+), (0x[\da-f]+)\)', mapping):
+    if not dual and int(pa, 16) in {0xfdcb8000, 0xfe270000, 0x3c0400000, 0x3c0500000, 0x3c0700000, 0xf2000000, 0xf2200000}:
+        continue
+    windows.append((pa, '0x42d00000' if pa == '0xf2200000' else va,
+                    '0x8000' if pa in ('0xf4200000', '0xf2200000') else size))
+mapping_file = dest / 'mapping.rs'
+mapping_file.write_text('const STATUS: usize = 0x41000000;\n'
+                        f'const PHYSICAL: [(u64, usize, usize); {len(windows)}] = [\n' +
+                        ''.join(f'    ({pa}, {va}, {size}),\n' for pa, va, size in windows) + '];\n')
+modules['mapping.rs'] = mapping_file
+diagnostic = os.environ.get('R5S_LAN1_TX_DIAGNOSTIC') == '1'
+if diagnostic and repair != 1:
+    sys.exit('The TX diagnostic requires the supervised LAN1-only profile')
+wan_udp = bool(stage) or os.environ.get('R5S_B51_WAN_UDP') == '1'
+if wan_udp and not stage and (not diagnostic or repair != 1 or os.environ.get('R5S_LAN1_TX_NO_CLOSE') != '1'
+                or os.environ.get('R5S_B51_EXPERIMENT', 'observe') != 'observe'):
+    sys.exit('WAN status requires the LAN1 v3 observe diagnostic')
+features = ['supervised' if repair is not None else 'lan-dhcp' if dual else 'lan1-only']
+if os.environ.get('R5S_LAN1_TX_NO_CLOSE') == '1':
+    if repair != 1:
+        sys.exit('TX No Close requires the supervised LAN1-only profile')
+    features.append('tx-no-close')
+if logical:
+    features += ['lan-port']
+    if mask == 3:
+        features.append('lan-bridge')
+    modules['queue.rs'] = queue
+if zero_copy:
+    features.append('zc')
+    modules['zc.rs'] = zc
+if driver_gro and fast_lan:
+    features.append('rx-gro')
+    modules['tso.rs'] = tso
+if tso_ports:
+    modules['tso.rs'] = tso
+    modules['tso_testgen.rs'] = tso_testgen
+    if 'lan1' in tso_ports:
+        features.append('tso')
+        if os.environ.get('R5S_TSO_TEST') == '1':
+            features.append('tso-test')
+if diagnostic:
+    features.append('tx-diagnostic')
+    variant = os.environ.get('R5S_B51_EXPERIMENT', 'observe')
+    if variant not in ('observe', 'tx-check', 'tally-rx-first'):
+        sys.exit('Unknown B51 experiment')
+    if variant != 'observe':
+        if 'tx-no-close' not in features:
+            sys.exit('B51 comparison requires No Close v3')
+        features.append(variant)
+elif repair == 1 and os.environ.get('R5S_LAN1_TX_SELF_TEST') == '1':
+    features.append('tx-self-test')
+elf = build('pds/pcie_provider', 'provider', sdk, extra=modules, features=tuple(features))
+shutil.copyfile(elf, dest / 'provider.elf')
+if dual:
+    inherited = [f for f in features[1:] if f not in ('tso', 'tso-test')]
+    shutil.copyfile(build('pds/pcie_provider', 'provider2', sdk, extra=modules, features=(('lan2-standalone' if repair == 2 else 'lan2'), *(['supervised'] if repair is not None else []), *(['tx-diagnostic', 'tx-no-close'] if stage == 'lan2-tx' else inherited if logical else []), *(['tso', *(['tso-test'] if os.environ.get('R5S_TSO_TEST') == '1' else [])] if 'lan2' in tso_ports else []))), dest / 'provider2.elf')
+pinned = {
+    'system.system': 'fcff19368f6aae566052dfe85ba9c226d35a4c1e221d9d691c81aa560561186b',
+    'driver.elf': 'f8174b8e3821744d9a9646fb2174def2bdf3be8aee797868bfe20b419ea5dbe0',
+    'probe.elf': '8740ccf3d3a5f17655c04b278adbdc1c44cdf512c7f97ac062f364b008766005',
+    'health.elf': 'f9cce9938b3a93c3f4aa01c7015aaa51d8d0e5313015e685eee2a43b2c036c8b',
+}
+for name, digest in pinned.items():
+    if sha256(wan / name) != digest:
+        sys.exit(f'Unexpected WAN baseline {name}')
+system = ET.parse(wan / 'system.system').getroot()
+if options.get('R5S_GMAC_RING') == '256':
+    if not zero_copy or options.get('R5S_ZC_POOL_BUFFERS') != '1024':
+        sys.exit('256-slot GMAC DMA requires the 1024-buffer production profile')
+    if (not any(start <= gmac_start and gmac_end <= end for start,end in banks)
+            or any(start < gmac_end and gmac_start < end for start,end in reserved)):
+        sys.exit('256-slot GMAC DMA arena escapes board DRAM or overlaps a reservation')
+    dma_pool = system.find("memory_region[@name='dma_pool']")
+    dma_pool.set('size', hex(gmac_end - gmac_start))
+    if gmac_nc:
+        dma_pool.set('page_size', '0x1000')
+        for mapping in system.iter('map'):
+            if mapping.get('mr') == 'dma_pool':
+                mapping.set('cached', 'false')
+for image in system.iter('program_image'):
+    name = image.get('path')
+    shutil.copyfile(wan / name, dest / name)
+if wan_udp:
+    extra = {'queue.rs': root / 'pds/gmac_dma_corrected/src/queue.rs',
+             'shared.rs': root / 'pds/gmac_probe/src/shared.rs'}
+    if zero_copy:
+        extra['zc.rs'] = zc
+    wan_features = [*quiet_feature, 'b51-udp']
+    if stage:
+        wan_profile = dest / 'wan_status_profile.rs'
+        wan_profile.write_text(f'const PORT_MASK: u32 = {mask};\nconst LOGICAL: bool = {str(logical).lower()};\nconst FALLBACK: u32 = {fallback_option()};\n')
+        extra['wan_status_profile.rs'] = wan_profile
+        wan_features += ['shared-wan' if routing else 'lan-status']
+        if workers:
+            wan_features.append('forward-workers')
+        if rx_queues > 1:
+            wan_features.append('rss-stats')
+        if zero_copy:
+            wan_features.append('lan-tx-stats')
+        if sdk_config == 'benchmark':
+            wan_features.append('sched-stats')
+        if zero_copy:
+            wan_features.append('zc')
+        if tso_wan or tso_ports:
+            # Schema 7: the WAN app publishes the per-port TSO diagnostics.
+            wan_features.append('tso')
+    shutil.copyfile(build('pds/wan_dhcp_freshness', 'wan-app', sdk, extra=extra,
+                          features=tuple(wan_features)), dest / 'probe.elf')
+    ET.SubElement(system.find("protection_domain[@name='wan']"), 'map',
+                  mr='pcie_status', vaddr='0x41000000', perms='r')
+# The WAN app keeps its baseline queues. The GMAC build enables its existing LED support.
+shutil.copyfile(build('pds/gmac_dma_corrected', 'wan-driver', sdk, raw=True,
+                      features=(*quiet_feature, 'lan-gated', 'wan-shutdown', *(['zc'] if zero_copy else []),
+                                *(['rx-gro'] if driver_gro and fast_wan else []),
+                                *(['tso', *(['tso-test'] if os.environ.get('R5S_TSO_TEST') == '1' else [])] if tso_wan else []))
+                      if routing else (*quiet_feature, 'lan-gated')), dest / 'driver.elf')
+if hybrid_irq:
+    ET.SubElement(system.find("protection_domain[@name='gmac']"), 'irq', irq='59', id='14', trigger='level')
+    channel = ET.SubElement(system, 'channel')
+    ET.SubElement(channel, 'end', pd='heartbeat', id='2')
+    ET.SubElement(channel, 'end', pd='gmac', id='15')
+ET.SubElement(system, 'memory_region', name='gpio2', phys_addr='0xfe750000', size='0x1000')
+ET.SubElement(system.find("protection_domain[@name='gmac']"), 'map',
+              mr='gpio2', vaddr='0x50007000', perms='rw', cached='false')
+supervisor = root / 'pds/wan_dhcp_diagnostic'
+extra = {name: supervisor / source for name, source in
+         [('main.rs', 'supervisor.rs'), ('milestones.rs', 'milestones.rs'), ('poll_deadline.rs', 'poll_deadline.rs')]}
+extra['policy.rs'] = root / 'pds/network_supervisor/src/wan_policy.rs'
+if repair is not None:
+    selection = dest / 'lan_selection.rs'
+    selection.write_text(f'const LAN_SELECTION: u8 = {repair};\n'
+                         f'const LAN_FRONT_LEDS: bool = {str(routing).lower()};\n')
+    extra['lan_selection.rs'] = selection
+supervisor_feature = 'router-runtime' if routing else 'supervised' if repair is not None else 'lan-dhcp' if dual else 'lan1-only'
+shutil.copyfile(build('pds/network_supervisor', 'heartbeat', sdk, extra=extra,
+                      features=(supervisor_feature, *(('plain-leds',) if not led_faults else ()))), dest / 'heartbeat.elf')
+ET.SubElement(system.find("protection_domain[@name='heartbeat']"), 'map', mr='pcie_status', vaddr='0x41000000', perms='r')
+second_pool = 'lan2_dma' if dual else 'nc_padding'
+pools = [('lan1_dma', lan1[1], lan1[3]), (second_pool, lan2[1], lan2[3])]
+if workers:
+    if wide_ring:
+        pools += [('zc_pool', shared_pa, pool_size), ('zc_padding', padding_pa, 0x100000)]
+        if shared_pa == 0x24600000:
+            # The 2 MiB placement (any cache policy) leaves the MiB between the
+            # lan1 arena and the pool reserved so kernel objects cannot land in
+            # the NC window.
+            pools += [('lan1_nc_padding', lan1[1] + lan1[3], 0x100000)]
+        if writeback and pool_size == 0x100000:
+            pools += [('zc_wb_padding', shared_pa + 0x100000, 0x100000)]
+    else:
+        # The default pool absorbs the padding MiB: 1024 x 2 KiB buffers at
+        # shared_pa..shared_pa+0x200000, still inside the Normal-NC window.
+        pools += [('zc_pool', shared_pa, 0x200000)]
+
+for name, start, size in pools:
+    ET.SubElement(system, 'memory_region', name=name, phys_addr=hex(start), size=hex(size), page_size='0x1000')
+ET.SubElement(system, 'memory_region', name='pcie_status', size='0x1000')
+if zero_copy:
+    ET.SubElement(system, 'memory_region', name='zc_meta', size='0x4000')
+    ET.SubElement(system, 'memory_region', name='zc_links', size='0x4000')
+    ET.SubElement(system, 'memory_region', name='wan_control_tx', size='0x4000')
+    for owner in ('gmac', 'wan'):
+        domain = system.find(f"protection_domain[@name='{owner}']")
+        ET.SubElement(domain, 'map', mr='wan_control_tx', vaddr='0x66a10000', perms='rw')
+        ET.SubElement(domain, 'map', mr='zc_pool', vaddr='0x66000000',
+                      perms='rw' if owner == 'gmac' else 'r', cached=pool_cached)
+        ET.SubElement(domain, 'map', mr='zc_meta', vaddr='0x66800000', perms='rw')
+        ET.SubElement(domain, 'map', mr='zc_links', vaddr='0x66900000', perms='rw')
+    if hybrid_irq:
+        channel = ET.SubElement(system, 'channel')
+        for owner in ('gmac', 'wan'):
+            ET.SubElement(channel, 'end', pd=owner, id='16')
+pd = ET.SubElement(system, 'protection_domain', name='lan1', stack_size='0x8000', priority='103', budget='100', period='1000')
+ET.SubElement(pd, 'program_image', path='provider.elf')
+ET.SubElement(pd, 'map', mr='lan1_dma', vaddr='0x62000000', perms='rw', cached='false', setvar_vaddr='LAN1_VA')
+ET.SubElement(pd, 'setvar', region_paddr='lan1_dma', symbol='LAN1_PA')
+ET.SubElement(pd, 'map', mr='pcie_status', vaddr='0x41000000', perms='rw')
+for pa, va, size in windows:
+    region = system.find(f"memory_region[@phys_addr='{pa}']")
+    if region is None:
+        region = ET.SubElement(system, 'memory_region', name=f'pcie_{pa}', phys_addr=pa, size=size)
+    if region.get('size') != size:
+        sys.exit(f'Conflicting MMIO size at {pa}')
+    ET.SubElement(pd, 'map', mr=region.get('name'), vaddr=va, perms='rw', cached='false')
+if zero_copy:
+    ET.SubElement(pd, 'map', mr='zc_pool', vaddr='0x66000000', perms='rw', cached=pool_cached)
+    ET.SubElement(pd, 'map', mr='zc_meta', vaddr='0x66800000', perms='rw')
+    ET.SubElement(pd, 'map', mr='zc_links', vaddr='0x66900000', perms='rw')
+if dual:
+    ET.SubElement(system, 'memory_region', name='lan2_status', size='0x1000')
+    ET.SubElement(system.find("protection_domain[@name='heartbeat']"), 'map',
+                  mr='lan2_status', vaddr='0x41100000', perms='r')
+    second = ET.SubElement(system, 'protection_domain', name='lan2', stack_size='0x40000',
+                           priority='102', budget='100', period='1000')
+    pd.set('stack_size', '0x40000')
+    ET.SubElement(second, 'program_image', path='provider2.elf')
+    for mapping in pd.findall('map'):
+        attrs = mapping.attrib.copy()
+        if attrs['mr'] == 'lan1_dma':
+            attrs['mr'] = 'lan2_dma'
+        elif attrs['mr'] == 'pcie_status':
+            attrs['mr'] = 'lan2_status'
+        ET.SubElement(second, 'map', attrs)
+    ET.SubElement(second, 'setvar', region_paddr='lan2_dma', symbol='LAN1_PA')
+    ET.SubElement(second, 'map', mr='pcie_status', vaddr='0x41100000', perms='r')
+if repair is not None:
+    for index, owner in enumerate(('lan1', 'lan2')):
+        domain = system.find(f"protection_domain[@name='{owner}']")
+        if repair & (1 << index):
+            domain.set('priority', str(99-index))
+            domain.set('budget', str(ROUTER_SCHEDULE['baseline'][owner]))
+            channel = ET.SubElement(system, 'channel')
+            ET.SubElement(channel, 'end', pd='heartbeat', id=str(index))
+            ET.SubElement(channel, 'end', pd=owner, id='0')
+        else:
+            system.remove(domain)
+if stage:
+    wan_pd = system.find("protection_domain[@name='wan']")
+    ET.SubElement(wan_pd, 'map', mr='lan2_status', vaddr='0x41100000', perms='r')
+    if logical:
+        dns = dns_option()
+        config = dest / 'lan_profile.rs'
+        config.write_text(f'const PORT_MASK: u8 = {mask};\n'
+                          f'const BRIDGE: bool = {str(mask == 3).lower()};\n'
+                          f'const IP: bool = {str(stage != "lan1-rx").lower()};\n'
+                          f'const DHCP: bool = {str(stage in ("dual-lan-dhcp", "wan-dhcp", "dual-lan-router")).lower()};\n'
+                          f'const DNS: [u32; 3] = [{",".join(map(str, (list(dns) + [0, 0, 0])[:3]))}];\n'
+                          f'const DNS_COUNT: usize = {len(dns)};\n')
+        logical_sources = {'main.rs': root / 'pds/pcie_provider/src/logical_lan.rs',
+                           'lan_profile.rs': config, 'queue.rs': queue,
+                           'shared.rs': root / 'pds/gmac_probe/src/shared.rs'}
+        if zero_copy:
+            logical_sources['zc.rs'] = zc
+        if lan_b51_udp:
+            for name in ('b51_udp.rs', 'network_snapshot.rs'):
+                logical_sources[name] = root / 'pds/wan_dhcp_freshness/src' / name
+        if gro:
+            logical_sources['tso.rs'] = tso
+        logical_feature = 'lan-b51-udp' if lan_b51_udp else 'shared-wan' if routing else 'lan-dhcp'
+        if workers:
+            for name in ('forward_shared.rs', 'forward_dispatch.rs'):
+                logical_sources[name] = root / 'pds/pcie_provider/src' / name
+        shutil.copyfile(build('pds/pcie_provider', 'logical-lan', sdk,
+                             extra=logical_sources, features=(logical_feature, *(['lan-tx-stats'] if zero_copy else []), *(['forward-workers'] if workers else []), *(['zc'] if zero_copy else []), *(['gro'] if gro else []), *(['sched-stats'] if sdk_config == 'benchmark' else []))), dest / 'logical-lan.elf')
+        svc = ET.SubElement(system, 'protection_domain', name='logical_lan', stack_size='0x40000',
+                            priority='97', budget=str(ROUTER_SCHEDULE['baseline']['logical_lan']), period='1000')
+        ET.SubElement(svc, 'program_image', path='logical-lan.elf')
+        if lan_b51_udp:
+            ET.SubElement(svc, 'map', mr='trace_sync', vaddr='0x40001000', perms='r', cached='true')
+        ET.SubElement(system, 'memory_region', name='logical_status', size='0x1000')
+        ET.SubElement(wan_pd, 'map', mr='logical_status', vaddr='0x41200000', perms='r')
+        ET.SubElement(svc, 'map', mr='logical_status', vaddr='0x41200000', perms='rw')
+        for index, (name, status) in enumerate((('lan1', 'pcie_status'), ('lan2', 'lan2_status'))):
+            if mask & (1 << index) == 0:
+                continue
+            mem = name + '_packets'
+            ET.SubElement(system, 'memory_region', name=mem, size='0x8000')
+            pd = system.find(f"protection_domain[@name='{name}']")
+            ET.SubElement(pd, 'map', mr=mem, vaddr='0x63000000', perms='rw')
+            ET.SubElement(svc, 'map', mr=mem, vaddr=hex(0x63000000 + index * 0x8000), perms='rw')
+            ET.SubElement(svc, 'map', mr=status, vaddr=hex(0x41000000 + index * 0x100000), perms='r')
+            if zero_copy:
+                control = name + '_control_tx'
+                control_va = hex(0x66f00000 + index * 0x4000)
+                ET.SubElement(system, 'memory_region', name=control, size='0x4000')
+                for domain in (pd, svc):
+                    ET.SubElement(domain, 'map', mr=control, vaddr=control_va, perms='rw')
+    if workers:
+        ET.SubElement(system, 'memory_region', name='forward_control', size='0x1000')
+        ET.SubElement(svc, 'map', mr='forward_control', vaddr='0x65000000', perms='rw')
+        if zero_copy:
+            ET.SubElement(svc, 'map', mr='zc_pool', vaddr='0x66000000', perms='rw', cached=pool_cached)
+            ET.SubElement(svc, 'map', mr='zc_meta', vaddr='0x66800000', perms='rw')
+            ET.SubElement(svc, 'map', mr='zc_links', vaddr='0x66900000', perms='rw')
+            gmac = system.find("protection_domain[@name='gmac']")
+            ET.SubElement(system, 'memory_region', name='wan_neighbor_tx', size='0x4000')
+            for domain in (gmac, svc):
+                ET.SubElement(domain, 'map', mr='wan_neighbor_tx', vaddr='0x66a14000', perms='rw')
+            if hybrid_irq:
+                channel = ET.SubElement(system, 'channel')
+                for domain in (gmac, svc):
+                    ET.SubElement(channel, 'end', pd=domain.get('name'), id='17')
+        sources = root / 'pds/pcie_provider/src'
+        if fast_lan:
+            ET.SubElement(system, 'memory_region', name='lan_steering', size='0x80000')
+            ET.SubElement(system, 'memory_region', name='steering_load', size='0x5000')
+            for owner in (svc, *(system.find(f"protection_domain[@name='lan{port}']") for port in (1, 2))):
+                ET.SubElement(owner, 'map', mr='lan_steering', vaddr='0x67500000', perms='rw')
+                ET.SubElement(owner, 'map', mr='steering_load', vaddr='0x67580000', perms='rw')
+        tx_flow_lanes = 5
+        for cpu in range(4):
+            owner = f'forward{cpu}'
+            config = dest / f'{owner}.rs'
+            config.write_text(f'const ID: usize = {cpu};\n')
+            path = owner + '.elf'
+            extra = {'main.rs': sources / 'forward_worker.rs', 'forward_shared.rs': sources / 'forward_shared.rs',
+                     'worker_profile.rs': config, 'queue.rs': queue,
+                     'shared.rs': root / 'pds/gmac_probe/src/shared.rs'}
+            if zero_copy:
+                extra['zc.rs'] = zc
+            if worker_gro:
+                extra['tso.rs'] = tso
+            shutil.copyfile(build('pds/pcie_provider', owner, sdk, extra=extra,
+                                  features=('forward-workers', *(['zc'] if zero_copy else []), *(['gro'] if worker_gro else []), *(['sched-stats'] if sdk_config == 'benchmark' else []))), dest / path)
+            worker = ET.SubElement(system, 'protection_domain', name=owner, priority='96',
+                                   budget=str(ROUTER_SCHEDULE[schedule][owner]), period='1000',
+                                   stack_size='0x40000')
+            ET.SubElement(worker, 'program_image', path=path)
+            ET.SubElement(worker, 'map', mr='forward_control', vaddr='0x65000000', perms='r')
+            if fast_lan:
+                ET.SubElement(worker, 'map', mr='steering_load', vaddr='0x67580000', perms='rw')
+                ET.SubElement(worker, 'map', mr='lan_steering', vaddr='0x67500000', perms='rw')
+            if zero_copy:
+                ET.SubElement(worker, 'map', mr='zc_pool', vaddr='0x66000000', perms='rw', cached=pool_cached)
+                ET.SubElement(worker, 'map', mr='zc_meta', vaddr='0x66800000', perms='rw')
+            ET.SubElement(system, 'memory_region', name=owner, size='0x8000')
+            for pd in (svc, worker):
+                ET.SubElement(pd, 'map', mr=owner, vaddr=hex(0x65100000 + cpu * 0x8000), perms='rw')
+            channel = ET.SubElement(system, 'channel')
+            ET.SubElement(channel, 'end', pd='logical_lan', id=str(8 + cpu))
+            ET.SubElement(channel, 'end', pd=owner, id='0')
+            if fast_wan or worker_egress:
+                gmac = system.find("protection_domain[@name='gmac']")
+            if worker_egress:
+                memory = f'wan_worker_tx{cpu}'
+                ET.SubElement(system, 'memory_region', name=memory, size=hex(tx_flow_lanes * 0x4000))
+                address = hex(0x67000000 + cpu * tx_flow_lanes * 0x4000)
+                for pd in (gmac, worker):
+                    ET.SubElement(pd, 'map', mr=memory, vaddr=address, perms='rw')
+            if fast_wan:
+                memory = f'wan_fast_rx{cpu}'
+                ET.SubElement(system, 'memory_region', name=memory, size='0x4000')
+                address = hex(0x66b00000 + cpu * 0x4000)
+                for pd in (gmac, worker):
+                    ET.SubElement(pd, 'map', mr=memory, vaddr=address, perms='rw')
+                channel = ET.SubElement(system, 'channel')
+                ET.SubElement(channel, 'end', pd='gmac', id=str(10 + cpu))
+                ET.SubElement(channel, 'end', pd=owner, id='1')
+            if fast_lan:
+                for port in range(2):
+                    lan = f'lan{port + 1}'
+                    driver = system.find(f"protection_domain[@name='{lan}']")
+                    memory = f'{lan}_fast_rx{cpu}'
+                    ET.SubElement(system, 'memory_region', name=memory, size='0x4000')
+                    address = hex(0x66c00000 + (port * 4 + cpu) * 0x4000)
+                    for pd in (driver, worker):
+                        ET.SubElement(pd, 'map', mr=memory, vaddr=address, perms='rw')
+                    channel = ET.SubElement(system, 'channel')
+                    ET.SubElement(channel, 'end', pd=lan, id=str(10 + cpu))
+                    ET.SubElement(channel, 'end', pd=owner, id=str(2 + port))
+            if worker_lan_egress:
+                for port in range(2):
+                    lan = f'lan{port + 1}'
+                    driver = system.find(f"protection_domain[@name='{lan}']")
+                    memory = f'{lan}_worker_tx{cpu}'
+                    ET.SubElement(system, 'memory_region', name=memory, size=hex(tx_flow_lanes * 0x4000))
+                    address = hex(0x67200000 + (port * 4 + cpu) * tx_flow_lanes * 0x4000)
+                    for pd in (driver, worker):
+                        ET.SubElement(pd, 'map', mr=memory, vaddr=address, perms='rw')
+        if fast_lan or worker_lan_egress:
+            for lan in ('lan1', 'lan2'):
+                driver = system.find(f"protection_domain[@name='{lan}']")
+                ET.SubElement(driver, 'map', mr='forward_control', vaddr='0x65000000', perms='r')
+        if worker_egress:
+            ET.SubElement(system, 'memory_region', name='wan_worker_route', size='0x1000')
+            ET.SubElement(svc, 'map', mr='wan_worker_route', vaddr='0x66d00000', perms='rw')
+            ET.SubElement(gmac, 'map', mr='wan_worker_route', vaddr='0x66d00000', perms='r')
+            for cpu in range(4):
+                worker = system.find(f"protection_domain[@name='forward{cpu}']")
+                ET.SubElement(worker, 'map', mr='wan_worker_route', vaddr='0x66d00000', perms='r')
+    if fast_wan or worker_egress:
+        ET.SubElement(gmac, 'map', mr='forward_control', vaddr='0x65000000', perms='r')
+    if fast_wan:
+        ET.SubElement(system, 'memory_region', name='wan_fast_frames', size='0x8000')
+        for owner in (system.find("protection_domain[@name='gmac']"), svc):
+            ET.SubElement(owner, 'map', mr='wan_fast_frames', vaddr='0x66a00000', perms='rw')
+    if routing:
+        ET.SubElement(system, 'memory_region', name='wan_relay', size='0x8000')
+        for owner in (wan_pd, svc):
+            ET.SubElement(owner, 'map', mr='wan_relay', vaddr='0x64000000', perms='rw')
+        for region, address in (('probe_status', '0x40004000'), ('link_status', '0x40002000')):
+            ET.SubElement(svc, 'map', mr=region, vaddr=address, perms='r')
+        led_owner = system.find("protection_domain[@name='heartbeat']")
+        ET.SubElement(system, 'memory_region', name='gpio3', phys_addr='0xfe760000', size='0x1000')
+        for region, address in (('gpio3', '0x40006000'), ('grf', '0x40007000'), ('cru', '0x40008000')):
+            ET.SubElement(led_owner, 'map', mr=region, vaddr=address, perms='rw', cached='false')
+    for index, port in enumerate(('lan1', 'lan2')):
+        pd = system.find(f"protection_domain[@name='{port}']")
+        if pd is None:
+            continue
+        other = (('0xfe270000', '0x3c0400000', '0x3c0500000', '0x3c0700000', '0xf2000000', '0xf2200000', '0xfdcb8000')
+                 if index == 0 else
+                 ('0xfe260000', '0x3c0000000', '0x3c0100000', '0x3c0300000', '0xf4000000', '0xf4200000', '0xfdc90000', '0xfe840000') if index == 1 else ())
+        for mapping in pd.findall('map'):
+            if mapping.get('mr') in {'pcie_' + pa for pa in other}:
+                pd.remove(mapping)
+if routing:
+    configure_schedule(system, schedule)
+    kernel_header = kernel.parent.parent / 'include/kernel/gen_config.h'
+    if not re.search(rf'^#define CONFIG_MAX_NUM_NODES\s+{4 if smp else 1}$',
+                     kernel_header.read_text(), re.M):
+        sys.exit('Kernel CPU count does not match router schedule')
+if zero_copy:
+    pool_maps = system.findall(".//map[@mr='zc_pool']")
+    if not pool_maps or any(mapping.get('cached') != pool_cached for mapping in pool_maps):
+        sys.exit('Shared payload aliases use inconsistent cache attributes')
+ET.indent(system)
+sdf = dest / 'system.system'
+ET.ElementTree(system).write(sdf, encoding='unicode')
+report = dest / 'microkit-report.txt'
+trace.run([sdk / 'bin/microkit', sdf, '--board', 'nanopi_r5s_trace', '--config', sdk_config,
+           '--search-path', dest, '-o', dest / 'layout.bin', '-r', report], dest / 'logs/microkit.log')
+allocations = re.findall(r"'([^']+)' @ (0x[0-9a-f]+)", report.read_text())
+actual = [(int(addr, 16), name) for name, addr in allocations if lan1[1] <= int(addr, 16) < nc_end]
+expected = [(start + i * 4096, f'frame_mr_{name}_{i:09d}')
+            for name, start, size in pools for i in range(size // 4096)]
+if sorted(actual) != sorted(expected):
+    sys.exit('LAN1 pool or Normal-NC padding allocation conflict')
+print(f"Verified fixed allocations for {', '.join(name for name, _, _ in pools)}")

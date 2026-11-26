@@ -1,0 +1,4 @@
+&vccio_acodec {
+    regulator-boot-on;
+    regulator-always-on;
+};

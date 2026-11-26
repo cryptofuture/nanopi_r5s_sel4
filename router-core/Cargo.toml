@@ -1,0 +1,14 @@
+[package]
+name = "r5s-router-core"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+[lib]
+path = "src/lib.rs"
+
+[features]
+integrated-lan = []
+shared-nat = []
+
+[dev-dependencies]
+smoltcp = { version = "=0.12.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-dhcpv4", "socket-icmp"] }

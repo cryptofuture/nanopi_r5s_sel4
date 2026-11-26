@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+import argparse
+import os
+from pathlib import Path
+import subprocess
+import sys
+from diag import assemble, record_artifacts
+
+root = Path(__file__).resolve().parents[1]
+p = argparse.ArgumentParser(description='Build and audit the separate payload-free U-Boot diagnostic')
+p.add_argument('--package-only', action='store_true', help='Re-audit and package the existing diagnostic build')
+p.add_argument('--output', type=Path, default=root / 'out/diag-uboot/r5s-uboot-diag.img')
+args = p.parse_args()
+os.chdir(root)
+args.output = args.output.resolve()
+if args.output.parent != root / 'out/diag-uboot':
+    sys.exit('Diagnostic outputs must stay in out/diag-uboot')
+if args.output.exists():
+    sys.exit('Destination exists; use a new --output filename')
+directory = root / 'out/diag-uboot'
+(directory / 'logs').mkdir(parents=True, exist_ok=True)
+subprocess.run([sys.executable, 'scripts/sources'], check=True)
+if not args.package_only:
+    with (directory / 'logs/build-uboot.log').open('w') as log:
+        subprocess.run([sys.executable, 'scripts/build-uboot', '--diagnostic'],
+                        stdout=log, stderr=subprocess.STDOUT, check=True)
+manifest = assemble(root, args.output)
+record_artifacts(root, args.output, manifest)
+print(f'Diagnostic built and statically validated: {args.output}; hardware untested')

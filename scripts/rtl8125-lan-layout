@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def layout(tree):
+    roles = {}
+    windows = []
+    buses = set()
+    for role, apb in (('lan1', 0xfe260000), ('lan2', 0xfe270000)):
+        node = tree[f'/pcie@{apb:x}']
+        props = node['properties']
+        if props['status'] != 'okay' or props['num-lanes'] != [1]:
+            raise ValueError(f'{role}: expected enabled single lane')
+        regs = dict(zip(props['reg-names'].split('\0'), node['reg'], strict=True))
+        if set(regs) != {'pcie-dbi', 'pcie-apb', 'config'} or regs['pcie-apb'][0] != apb:
+            raise ValueError(f'{role}: unexpected register map')
+        first, last = props['bus-range']
+        if not 0 <= first < last <= 255:
+            raise ValueError(f'{role}: invalid bus range')
+        domain = set(range(first, last + 1))
+        if buses & domain:
+            raise ValueError(f'{role}: overlapping bus range')
+        buses |= domain
+        ranges = props['ranges']
+        if len(ranges) % 7:
+            raise ValueError(f'{role}: truncated PCI range')
+        memory = []
+        for i in range(0, len(ranges), 7):
+            flags, chi, clo, phi, plo, shi, slo = ranges[i:i+7]
+            if (flags & 0x03000000) in (0x02000000, 0x03000000):
+                memory.append({'bus': (chi << 32) | clo, 'cpu': (phi << 32) | plo,
+                               'size': (shi << 32) | slo})
+        for start, size in [*regs.values(), *((m['cpu'], m['size']) for m in memory)]:
+            if size <= 0 or start < 0 or start + size > 1 << 64:
+                raise ValueError(f'{role}: invalid window')
+            if any(start < end and low < start + size for low, end in windows):
+                raise ValueError(f'{role}: overlapping host windows')
+            windows.append((start, start + size))
+        roles[role] = dict(registers=regs, buses=[first, last], memory=memory,
+                           reset=node['reset-gpios'], clocks=node['clocks'],
+                           phy=node['phys'], resets=node['resets'],
+                           expected_endpoint={'vendor': 0x10ec, 'device': 0x8125})
+    return roles
+
+
+if __name__ == '__main__':
+    evidence = ROOT / 'out/router/pcie-evidence.json'
+    print(json.dumps(layout(json.loads(evidence.read_text())), indent=2))

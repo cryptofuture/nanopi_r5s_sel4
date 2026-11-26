@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+import argparse
+from pathlib import Path
+import sys
+from handoff_trace import build_all
+
+p = argparse.ArgumentParser()
+p.add_argument('--stop-at-checkpoint', type=int, choices=range(1, 9), default=0)
+args = p.parse_args()
+build_all(args.stop_at_checkpoint)

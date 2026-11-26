@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Package two verified runs of the matrix and exercise the extracted recovery tools."""
+import argparse
+import ast
+import gzip
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from xml.etree import ElementTree
+from image import verify
+from policy import sha256
+from dual_lan_profile import STAGES, WORKER_SCHEDULES, configure_schedule
+
+scripts = Path(__file__).resolve().parent
+root = scripts.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("matrix", type=Path)
+parser.add_argument("repeat", type=Path)
+parser.add_argument("operator_report", type=Path)
+parser.add_argument("--wan-udp", action="store_true",
+                    help="package two independent W builds, supplied as their direct build directories")
+parser.add_argument("--early-init-repair", action="store_true")
+parser.add_argument("--dual-lan", action="store_true")
+parser.add_argument("--checkpoint", choices=tuple(STAGES), help="package two direct build directories for one checkpoint")
+parser.add_argument("--comparison", type=Path, help="Verified multicore rollback image")
+args = parser.parse_args()
+if args.comparison and args.checkpoint != "dual-lan-router":
+    parser.error("--comparison requires the dual-lan-router checkpoint")
+if args.checkpoint and not args.dual_lan:
+    parser.error("--checkpoint requires --dual-lan")
+if args.dual_lan and (args.wan_udp or args.early_init_repair):
+    parser.error("--dual-lan selects its own matrix")
+if args.early_init_repair and not args.wan_udp:
+    parser.error("--early-init-repair requires --wan-udp")
+variants = (args.checkpoint,) if args.checkpoint else STAGES if args.dual_lan else "W" if args.wan_udp else "ABCDE"
+matrix, repeat = args.matrix.resolve(), args.repeat.resolve()
+image = Path("r5s-rtl8125-lan-repair.img")
+baseline = root / "out/b51-register-recheck.2A7u4tOs/image"
+
+
+def copy_tools(stage):
+    todo = ["flash-sd", "verify-image", "decode-b51-uart"]
+    if args.wan_udp or args.dual_lan:
+        todo.append("read-b51-udp")
+    copied = set()
+    while todo:
+        name = todo.pop()
+        if name in copied:
+            continue
+        copied.add(name)
+        path = scripts / name
+        shutil.copy2(path, stage / "scripts" / name)
+        for node in ast.walk(ast.parse(path.read_text())):
+            names = ([node.module] if isinstance(node, ast.ImportFrom) else
+                     [item.name for item in node.names] if isinstance(node, ast.Import) else [])
+            for module in names:
+                if module and (scripts / (module + ".py")).is_file():
+                    todo.append(module + ".py")
+    (stage / "protocol").mkdir()
+    shutil.copy2(root / "protocol/diagnostics-v2.json", stage / "protocol")
+
+
+def verify_build(variant, first, second):
+    a, b = first / image, second / image
+    if a.samefile(b) or sha256(a) != sha256(b):
+        raise ValueError(f"{variant}: independent images differ or alias")
+    manifest = verify(a)
+    if args.early_init_repair and (manifest.get("b51_status_version") != 2 or
+            verify(b) != manifest or any(sha256(first / name) != sha256(second / name)
+                                          for name in ("provider.elf", "probe.elf"))):
+        raise ValueError("Early-init artifacts did not reproduce")
+    if manifest != json.loads(a.with_suffix(".manifest.json").read_text()):
+        raise ValueError(f"{variant}: external manifest differs")
+    if args.dual_lan:
+        if (manifest.get("lan_checkpoint") != variant or verify(b) != manifest
+                or manifest != json.loads(b.with_suffix(".manifest.json").read_text())):
+            raise ValueError(f"{variant}: staged manifests differ")
+        ports = STAGES[variant]
+        expected_ports = {"lan1", "lan2"} if ports == "both" else {ports}
+        for build in (first, second):
+            system = ElementTree.parse(build / "system.system")
+            domains = {pd.get("name"): pd for pd in system.findall("protection_domain")}
+            if set(domains) & {"lan1", "lan2"} != expected_ports:
+                raise ValueError(f"{variant}: wrong PCIe owners")
+            for name in ("driver.elf", "health.elf"):
+                expected = sha256(baseline / name)
+                if variant == "dual-lan-router" and name == "driver.elf":
+                    expected = manifest.get("wan_shutdown_driver_sha256", expected)
+                if sha256(build / name) != expected:
+                    raise ValueError(f"{variant}: changed baseline ELF {name}")
+            for port in expected_ports:
+                mappings = {m.get("mr") for m in domains[port].findall("map")}
+                other = "lan2" if port == "lan1" else "lan1"
+                other_mmio = {
+                    "lan1": {"fe260000", "3c0000000", "3c0100000", "3c0300000", "f4000000", "f4200000"},
+                    "lan2": {"fe270000", "3c0400000", "3c0500000", "3c0700000", "f2000000", "f2200000"},
+                }
+                if (port + "_dma" not in mappings or other + "_dma" in mappings
+                        or any("pcie_0x" + address in mappings for address in other_mmio[other])):
+                    raise ValueError(f"{variant}: PCIe MMIO or DMA ownership violation")
+            for role in ("wan", "logical_lan"):
+                if role not in domains:
+                    continue
+                mappings = {m.get("mr"): m.get("perms") for m in domains[role].findall("map")}
+                if ("lan1_dma" in mappings or "lan2_dma" in mappings
+                        or any(name.startswith("pcie_") and name != "pcie_status" for name in mappings)
+                        or any(mappings.get(name) not in (None, "r") for name in ("pcie_status", "lan2_status"))
+                        or (role == "wan" and any(name.endswith("_packets") for name in mappings))):
+                    raise ValueError(f"{variant}: {role} has LAN MMIO or writable status")
+            if ("logical_lan" in domains) != (variant != "lan2-tx"):
+                raise ValueError(f"{variant}: unexpected logical LAN service")
+            if variant == "dual-lan-router":
+                if "router_schedule" in manifest:
+                    original = ElementTree.tostring(system.getroot())
+                    configure_schedule(system.getroot(), manifest["router_schedule"])
+                    if original != ElementTree.tostring(system.getroot()):
+                        raise ValueError("System budgets differ from image schedule")
+                if manifest.get("router_schedule") in WORKER_SCHEDULES:
+                    worker_names = {f"forward{i}" for i in range(4)}
+                    if not worker_names <= domains.keys():
+                        raise ValueError("Missing forwarding worker")
+                    expected_worker = {"forward_control": "r"}
+                    if manifest.get("zc_enabled"):
+                        # Zero-copy workers read and write shared pool payloads
+                        # and free dropped references; nothing else.
+                        expected_worker |= {"zc_pool": "rw", "zc_meta": "rw"}
+                    for i in range(4):
+                        worker = f"forward{i}"
+                        maps = {m.get("mr"): m.get("perms") for m in domains[worker].findall("map")}
+                        expected = {**expected_worker, worker: "rw"}
+                        if manifest.get("optimization_options", {}).get("R5S_WAN_FAST_PATH") == "1":
+                            expected[f"wan_fast_rx{i}"] = "rw"
+                        if manifest.get("optimization_options", {}).get("R5S_LAN_FAST_PATH") == "1":
+                            expected.update({f"lan{port}_fast_rx{i}": "rw" for port in (1, 2)})
+                        if manifest.get("optimization_options", {}).get("R5S_WORKER_WAN_EGRESS") == "1":
+                            expected[f"wan_worker_tx{i}"] = "rw"
+                        if manifest.get("optimization_options", {}).get("R5S_WORKER_LAN_EGRESS") == "1":
+                            expected.update({f"lan{port}_worker_tx{i}": "rw" for port in (1, 2)})
+                        if maps != expected:
+                            raise ValueError(f"Unexpected MMIO, DMA or queue mapping on {worker}")
+                options = manifest.get("optimization_options", {})
+                if options.get("R5S_GMAC_HYBRID_IRQ") == "1":
+                    irq_owners = [(name, irq.attrib) for name, pd in domains.items()
+                                  for irq in pd.findall("irq") if irq.get("irq") == "59"]
+                    if irq_owners != [("gmac", {"irq": "59", "id": "14", "trigger": "level"})]:
+                        raise ValueError("Unexpected GMAC IRQ assignment")
+                    kick = {("heartbeat", "2"), ("gmac", "15")}
+                    if not any({(end.get("pd"), end.get("id")) for end in channel.findall("end")} == kick
+                               for channel in system.findall("channel")):
+                        raise ValueError("Missing GMAC supervisor poll channel")
+                for option, prefix in (("R5S_WAN_FAST_PATH", "wan_fast_rx"),
+                                       ("R5S_WORKER_WAN_EGRESS", "wan_worker_tx")):
+                    if options.get(option) != "1":
+                        continue
+                    expected_owners = {f"{prefix}{i}": {"gmac": "rw", f"forward{i}": "rw"} for i in range(4)}
+                    if option == "R5S_WORKER_WAN_EGRESS":
+                        expected_owners["wan_worker_route"] = {"gmac": "r", "logical_lan": "rw"}
+                    for queue, expected in expected_owners.items():
+                        owners = {name: pd.find(f"map[@mr='{queue}']").get("perms")
+                                  for name, pd in domains.items() if pd.find(f"map[@mr='{queue}']") is not None}
+                        if owners != expected:
+                            raise ValueError(f"Unexpected ownership of {queue}")
+                    gmac_control = domains["gmac"].find("map[@mr='forward_control']")
+                    if gmac_control is None or gmac_control.get("perms") != "r":
+                        raise ValueError("GMAC forwarding control must be read-only")
+                for option, suffix in (("R5S_LAN_FAST_PATH", "fast_rx"),
+                                       ("R5S_WORKER_LAN_EGRESS", "worker_tx")):
+                    if options.get(option) != "1":
+                        continue
+                    for port in ("lan1", "lan2"):
+                        control = domains[port].find("map[@mr='forward_control']")
+                        if control is None or control.get("perms") != "r":
+                            raise ValueError(f"{port} forwarding control must be read-only")
+                        for index in range(4):
+                            queue = f"{port}_{suffix}{index}"
+                            owners = {name: pd.find(f"map[@mr='{queue}']").get("perms")
+                                      for name, pd in domains.items() if pd.find(f"map[@mr='{queue}']") is not None}
+                            if owners != {port: "rw", f"forward{index}": "rw"}:
+                                raise ValueError(f"Unexpected ownership of {queue}")
+                relay = {name for name, pd in domains.items() if pd.find("map[@mr='wan_relay']") is not None}
+                led = {name for name, pd in domains.items() if pd.find("map[@mr='gpio3']") is not None}
+                if relay != {"logical_lan", "wan"} or led != {"heartbeat"}:
+                    raise ValueError("Unexpected WAN relay or front LED ownership")
+        return
+    expected = {"B": "observe", "C": "observe", "D": "tx-check", "E": "tally-rx-first", "W": "observe"}
+    if (manifest.get("lan1_tx_diagnostic") is not True or manifest["lan2_enabled"]
+            or (manifest.get("lan1_tx_mode") == "no-close-v3") != (variant != "C")
+            or ("wan_b51_udp_port" in manifest) != (variant == "W")
+            or manifest.get("b51_experiment") != expected.get(variant)):
+        raise ValueError(f"{variant}: wrong diagnostic manifest")
+    if variant == "A":
+        if sha256(a) != sha256(baseline / image):
+            raise ValueError("A differs from preserved image")
+        return
+    for build in (first, second):
+        system = ElementTree.parse(build / "system.system")
+        if system.find(".//protection_domain[@name='lan2']") is not None:
+            raise ValueError("LAN2 domain present")
+        compare = ["driver.elf", "health.elf", "heartbeat.elf"]
+        if variant == "W":
+            control = root / "out/b51-dma-investigation/B"
+            expected_system = ElementTree.parse(control / "system.system")
+            wan_map = {"mr": "pcie_status", "vaddr": "0x41000000", "perms": "r"}
+            wan = expected_system.find(".//protection_domain[@name='wan']")
+            ElementTree.SubElement(wan, "map", wan_map)
+            ElementTree.indent(expected_system)
+            if ElementTree.tostring(system.getroot()) != ElementTree.tostring(expected_system.getroot()):
+                raise ValueError("Unexpected WAN diagnostic layout change")
+            if not args.early_init_repair and sha256(build / "provider.elf") != sha256(control / "provider.elf"):
+                raise ValueError("LAN1 experiment differs from B")
+        else:
+            compare.append("probe.elf")
+        for name in compare:
+            if sha256(build / name) != sha256(baseline / name):
+                raise ValueError(f"{variant}: changed baseline ELF {name}")
+
+
+archive = (matrix.parent / "r5s-b51-wan-udp.tar.gz" if args.wan_udp
+           else matrix / "r5s-b51-dma-debug.tar.gz")
+if args.dual_lan:
+    archive = (matrix.parent / f"r5s-{args.checkpoint}.tar.gz" if args.checkpoint
+               else matrix / "r5s-dual-lan-bringup.tar.gz")
+if args.early_init_repair:
+    archive = matrix.parent / "r5s-b51-wan-early-init-repair.tar.gz"
+with tempfile.TemporaryDirectory() as directory:
+    scratch = Path(directory)
+    stage = scratch / ("r5s-dual-lan-bringup" if args.dual_lan else "b51-wan-udp" if args.wan_udp else "b51-dma-debug")
+    (stage / "scripts").mkdir(parents=True)
+    copy_tools(stage)
+    shutil.copy2(args.operator_report, stage / "operator.md")
+    if args.checkpoint == "dual-lan-router":
+        for name in ("benchmark-router-board", "read-r5s-platform"):
+            shutil.copy2(scripts / name, stage / "scripts")
+        for name in ("sd-writing.md", "r5s-overlay-writer.md", "zero-copy-forwarding.md",
+                     "rtl8125-b51-root-cause.md", "tso-capability.md", "tso-hardware-validation.md",
+                     "r5s-datapath-performance.md"):
+            shutil.copy2(root / "docs" / name, stage)
+    if args.comparison:
+        comparison = verify(args.comparison)
+        if (comparison.get("lan_checkpoint") != "dual-lan-router"
+                or comparison.get("router_schedule") != "multicore"):
+            raise ValueError("Comparison image must use the multicore dual-LAN profile")
+        (stage / "comparison").mkdir()
+        shutil.copy2(args.comparison, stage / "comparison" / image)
+        (stage / "comparison" / image.with_suffix(".manifest.json")).write_text(
+            json.dumps(comparison, indent=2) + "\n")
+    for variant in variants:
+        first, second = (matrix, repeat) if args.wan_udp or args.checkpoint else (matrix / variant, repeat / variant)
+        verify_build(variant, first, second)
+        target = stage / variant
+        target.mkdir()
+        for suffix in (".img", ".manifest.json", ".sha256"):
+            shutil.copy2(first / image.with_suffix(suffix), target)
+    if args.wan_udp or args.dual_lan:
+        shutil.copy2(root / "out/b51-dma-debug-report.md", stage / "b51-status-reference.md")
+    files = sorted(p for p in stage.rglob("*") if p.is_file())
+    (stage / "SHA256SUMS").write_text("".join(f"{sha256(p)}  {p.relative_to(stage)}\n" for p in files))
+    candidate = scratch / archive.name
+    with candidate.open("wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0, compresslevel=2) as gz, tarfile.open(fileobj=gz, mode="w") as bundle:
+        for path in sorted(p for p in stage.rglob("*") if p.is_file()):
+            info = bundle.gettarinfo(str(path), str(path.relative_to(scratch)))
+            info.uid = info.gid = info.mtime = 0
+            info.uname = info.gname = ""
+            with path.open("rb") as stream:
+                bundle.addfile(info, stream)
+    extracted = scratch / "clean"
+    with tarfile.open(candidate) as bundle:
+        bundle.extractall(extracted, filter="data")
+    work = extracted / stage.name
+    def run(*command):
+        subprocess.run(command, cwd=work, check=True, stdout=subprocess.DEVNULL)
+    run("sha256sum", "-c", "SHA256SUMS")
+    run(sys.executable, "-E", "-s", "-B", "scripts/flash-sd", "--help")
+    if args.wan_udp or args.dual_lan:
+        run(sys.executable, "-E", "-s", "-B", "scripts/read-b51-udp", "--help")
+    if args.checkpoint == "dual-lan-router":
+        run(sys.executable, "-E", "-s", "-B", "scripts/benchmark-router-board", "--help")
+    for variant in variants:
+        run(sys.executable, "-E", "-s", "-B", "scripts/verify-image", Path(variant) / image)
+    if args.comparison:
+        run(sys.executable, "-E", "-s", "-B", "scripts/verify-image", Path("comparison") / image)
+    shutil.copyfile(candidate, archive)
+archive.with_name(archive.name + ".sha256").write_text(f"{sha256(archive)}  {archive.name}\n")
+print("Clean-extraction import, image, checksum, WAN ELF and LAN2 checks passed", archive)

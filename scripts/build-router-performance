@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Build one R5S performance profile in a fresh output directory."""
+import argparse
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parents[1]
+cpu = dict(R5S_ROUTER_SCHEDULE="high-throughput", R5S_DATAPATH_BATCH="16",
+           R5S_B51_RX_BATCH="16", R5S_B51_TX_BATCH="16", R5S_A55_OPT="1", R5S_WAN_FAST_PATH="1", R5S_QUEUE_PAD="1")
+dma = dict(R5S_B51_RING="128", R5S_GMAC_TX_BATCH="1")
+hardware = {f"R5S_{port}_{direction}": "1" for port in ("WAN", "LAN1", "LAN2")
+            for direction in ("RX_CHECKSUM", "TX_IPV4_CHECKSUM")}
+tso = {f"R5S_{port}_TSO": "1" for port in ("WAN", "LAN1", "LAN2")}
+gro = dict(R5S_GRO="1", R5S_WORKER_GRO="1", R5S_DRIVER_GRO="1", R5S_WAN_FAST_PATH="1")
+combined = cpu | dma | hardware | tso
+qualification = combined | gro | dict(
+    R5S_SDK_CONFIG="release", R5S_B51_RING="256", R5S_B51_RX_QUEUES="2", R5S_B51_TX_QUEUES="2",
+    R5S_ZC_CACHE="writeback", R5S_ZC_TX_CHECKSUM="1", R5S_GRO_TSO="1",
+    R5S_LAN_FAST_PATH="1", R5S_WORKER_LAN_EGRESS="1", R5S_WORKER_WAN_EGRESS="1",
+    R5S_GMAC_RX_CHANNELS="2", R5S_GMAC_TX_CHANNELS="2", R5S_GMAC_HYBRID_IRQ="1",
+    R5S_GMAC_EAME="1",
+)
+# Every implemented driver option on top of qualification, for board testing.
+# Ring/queue counts stay at the layout-checked 256/2+2 maximum.
+all_features = qualification | dict(
+    R5S_GMAC_PBL="32", R5S_GMAC_PBLX8="1", R5S_GMAC_RK3568_AXI="1", R5S_TSO_TEST="1",
+)
+bidirectional = all_features | dict(R5S_ROUTER_SCHEDULE="bidirectional",
+    R5S_B51_RX_QUEUES="1", R5S_TSO_TEST="0",
+    R5S_GMAC_WORKER_TX="1", R5S_GMAC_COPIED_CHECKSUM="1")
+profiles = {
+    "multicore": dict(R5S_NAT_HASH="0", R5S_BRIDGE_LOCAL_HASH="1"),
+    "cpu": cpu,
+    "dma": dma,
+    "hardware": hardware | dict(R5S_GMAC_PBL="16"),
+    "tso": tso,
+    "gro-tso": tso | gro,
+    "combined": combined,
+    "qualification": qualification,
+    "bidirectional": bidirectional,
+    "bidirectional-expanded": bidirectional | dict(R5S_ZC_POOL_BUFFERS="1024"),
+    "wan-throughput": bidirectional | dict(
+        R5S_ROUTER_SCHEDULE="wan-throughput", R5S_ZC_POOL_BUFFERS="1024", R5S_GMAC_RING="256",
+        R5S_GMAC_RX_CHANNELS="1", R5S_GMAC_TX_CHANNELS="1", R5S_GMAC_EAME="0",
+        R5S_B51_MPS="256", R5S_B51_MRRS="1024"),
+    "all-features": all_features,
+    "lan-rx-single": all_features | dict(R5S_B51_RX_QUEUES="1"),
+    "lan-rx-balanced": all_features | dict(R5S_B51_RX_QUEUES="1", R5S_B51_RING="128"),
+}
+# h4 = the board-champion tuning (440 download / 385 upload) as a one-command
+# profile, in two flavors: debug (logging + debug SDK + UDP status JSON + the
+# port-5201 TSO test generator) and production (quiet, no status endpoint, no
+# test generator, no supervisor fault-code LED patterns).
+h4 = profiles["wan-throughput"] | dict(
+    R5S_ROUTER_SCHEDULE="wan-throughput-isolated", R5S_GMAC_TX_EXTRA_BATCH="8",
+    R5S_ZC_DMA_BARRIERS="outer", R5S_DATAPATH_BATCH="16", R5S_B51_DMA_BARRIERS="full",
+    R5S_GMAC_DMA_CACHE="nc", R5S_B51_RING="256", R5S_IDLE_YIELD="1",
+    R5S_WORKER_LAN_PREP="1", R5S_B51_RX_BATCH="64",
+)
+profiles["h4-debug"] = h4 | dict(
+    R5S_SDK_CONFIG="debug", R5S_FIRMWARE_LOG="1", R5S_TSO_TEST="1",
+)
+profiles["h4-production"] = h4 | dict(
+    R5S_SDK_CONFIG="release", R5S_LAN_B51_UDP="0", R5S_LED_FAULTS="0",
+)
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("profile", choices=profiles)
+parser.add_argument("destination", type=Path)
+args = parser.parse_args()
+environment = {"R5S_DUAL_LAN_STAGE": "dual-lan-router", "R5S_ROUTER_SCHEDULE": "multicore",
+               "R5S_LAN_B51_UDP": "1", **profiles[args.profile], **os.environ}
+subprocess.run([sys.executable, root / "scripts/build-lan1-bringup",
+                args.destination.resolve(), "--lan-repair=both"], env=environment, check=True)

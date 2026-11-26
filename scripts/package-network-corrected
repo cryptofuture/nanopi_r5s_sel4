@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+import gzip,json,shutil,sys,tarfile,tempfile
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1];B=ROOT/'out/network-corrected';sys.path.insert(0,str(ROOT/'scripts'))
+from policy import sha256
+from image import verify
+
+def main():
+ for directory,profile in [('rawio','gmac-rawio'),('wan','wan-dhcp')]:
+  base=B/directory;image=base/f'r5s-{profile}.img';verify(image)
+  assert sha256(image)==sha256(base/f'r5s-{profile}.reproduced.img')
+  for p,h in json.loads((base/'source-hashes.json').read_text()).items():assert sha256(ROOT/p)==h,p
+ for p,h in json.loads((B/'rawio/ARTIFACTS.json').read_text())['preserved'].items():assert sha256(ROOT/p)==h,p
+ with tempfile.TemporaryDirectory(dir=B) as tmp:
+  root=Path(tmp)/'network-corrected';root.mkdir()
+  def copy(p,d):d.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(p,d)
+  def tree(p,d):
+   for f in p.rglob('*'):
+    if f.is_file() and not set(f.parts)&{'target','__pycache__','.git'}:copy(f,d/f.relative_to(p))
+  copy(B/'corrections.patch',root/'corrections.patch');copy(B/'compiled-link.c',root/'compiled-link.c')
+  for p in B.iterdir():
+   if p.is_file() and p.suffix in ['.md','.json']:copy(p,root/p.name)
+  for directory,profile in [('rawio','gmac-rawio'),('wan','wan-dhcp')]:
+   base=B/directory
+   copy(base/f'r5s-{profile}.img',root/f'r5s-{profile}.img')
+   copy(base/f'{"wan-manifest" if directory=="wan" else "ARTIFACTS"}.json',root/f'{profile}-build.json')
+   manifest=verify(base/f'r5s-{profile}.img');(root/f'r5s-{profile}.manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+   for name in ['source-hashes.json','layout-report.json','ARTIFACTS.json']:copy(base/name,root/'evidence'/directory/name)
+   for f in (base/profile).iterdir():
+    if f.is_file():copy(f,root/'evidence'/directory/f.name)
+   for name in ['u-boot.map','u-boot.dtb','u-boot.itb','idbloader.img','spl/u-boot-spl.bin']:copy(base/profile/'build'/name,root/'evidence'/directory/name)
+   tree(base/'logs',root/'logs'/directory)
+  for f in (ROOT/'scripts').iterdir():
+   if f.is_file() and (f.suffix=='.py' or f.name in ['flash-sd','verify-image']):copy(f,root/'scripts'/f.name)
+  copy(ROOT/'scripts/check-router-deps',root/'scripts/check-deps')
+  copy(ROOT/'tools/net-peer',root/'tools/net-peer');tree(ROOT/'tools/netprobe',root/'tools/netprobe');copy(ROOT/'protocol/diagnostics-v2.json',root/'protocol/diagnostics-v2.json')
+  for name in ['pds/gmac_dma_corrected','pds/network_supervisor','pds/gmac_probe','pds/net_probe','pds/wan_dhcp','drivers/gmac0','router-core']:tree(ROOT/name,root/'sources'/name)
+  for name in ['firmware/vccio1-boot-policy.dtsi','config/router-v1.json','sources.lock','router-dependencies.lock.json','tests/network_health_test.rs','tests/test_network_corrected.py']:copy(ROOT/name,root/'sources'/name)
+  for name in ['build-network-rawio','build-network-wan','audit-network-corrected','package-network-corrected','env']:copy(ROOT/'scripts'/name,root/'sources/scripts'/name)
+  tree(B/'logs',root/'logs/validation')
+  sums=''.join(f'{sha256(p)}  {p.relative_to(root)}\n' for p in sorted(root.rglob('*')) if p.is_file());(root/'SHA256SUMS').write_text(sums);(B/'bundle-SHA256SUMS').write_text(sums)
+  archive=B/'r5s-network-corrected-handoff.tar.gz';assert not archive.exists(),'Preserve existing archive'
+  with archive.open('wb') as raw,gzip.GzipFile(filename='',mode='wb',fileobj=raw,mtime=0) as compressed,tarfile.open(fileobj=compressed,mode='w') as t:
+   for p in sorted(root.rglob('*')):
+    if not p.is_file():continue
+    info=t.gettarinfo(p,arcname=str(p.relative_to(Path(tmp))));info.uid=info.gid=0;info.uname=info.gname='';info.mtime=0;info.mode=0o644
+    with p.open('rb') as f:t.addfile(info,f)
+  archive.with_name(archive.name+'.sha256').write_text(f'{sha256(archive)}  {archive.name}\n');print(sha256(archive))
+if __name__=='__main__':main()

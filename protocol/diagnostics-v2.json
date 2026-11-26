@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "delimiter_ms": 500,
+  "poll_deadline_ms": 10,
+  "health_deadline_ms": 100,
+  "lease_ms": 5000,
+  "states": {
+    "WAIT": [[true, 2000], [false, 2000]],
+    "READY": [[true, 200], [false, 3800]],
+    "IO_VERIFIED": [[true, 2500], [false, 500], [true, 200], [false, 2800]],
+    "FAULT": [[true,125],[false,125],[true,125],[false,125],[true,125],[false,125],[true,125],[false,125],[true,125],[false,125],[true,125],[false,125],[true,125],[false,125],[true,125],[false,4125]]
+  }
+}

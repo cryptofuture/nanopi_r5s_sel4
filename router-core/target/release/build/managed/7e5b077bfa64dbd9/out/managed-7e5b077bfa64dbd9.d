@@ -1,0 +1,11 @@
+/workspaces/mounted/projects/r5s_custom/router-core/target/release/build/managed/7e5b077bfa64dbd9/out/managed-7e5b077bfa64dbd9.d: /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/lib.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/object.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/slice.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/slotmap.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/map.rs
+
+/workspaces/mounted/projects/r5s_custom/router-core/target/release/build/managed/7e5b077bfa64dbd9/out/libmanaged-7e5b077bfa64dbd9.rlib: /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/lib.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/object.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/slice.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/slotmap.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/map.rs
+
+/workspaces/mounted/projects/r5s_custom/router-core/target/release/build/managed/7e5b077bfa64dbd9/out/libmanaged-7e5b077bfa64dbd9.rmeta: /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/lib.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/object.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/slice.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/slotmap.rs /home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/map.rs
+
+/home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/lib.rs:
+/home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/object.rs:
+/home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/slice.rs:
+/home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/slotmap.rs:
+/home/vscode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/managed-0.8.0/src/map.rs:

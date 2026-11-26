@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+import hashlib,json,os,runpy,shutil,sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import network_uboot as trace
+from policy import sha256
+from image import assemble_files,verify
+from diagnostics import SPEC
+from wan_stack_profile import WAN_STACK,check_stack
+from router_config import validate,dns_source
+ROOT=trace.ROOT;BASE=Path(sys.argv[1]).resolve()
+GATED=sys.argv[2:]==['--lan-gated']
+if sys.argv[2:] and not GATED:raise SystemExit('Unknown build profile')
+def main():
+ BASE.mkdir(parents=True)
+ (BASE/'logs').mkdir()
+ os.environ['CARGO_TARGET_AARCH64_SEL4_RUSTFLAGS']=f'--remap-path-prefix={BASE}=/r5s-router-wan-dhcp'
+ config=validate(json.loads((ROOT/'config/router-v1.json').read_text()))
+ trace.require((ROOT/'pds/wan_dhcp_freshness/src/config.rs').read_text()==dns_source(config),'Regenerate compiled DNS configuration')
+ stage=ROOT/'out/network-dma-restart/rawio';audit=json.loads((stage/'ARTIFACTS.json').read_text())
+ trace.require(sha256(stage/'gmac-rawio/driver.elf')=='4ed464a75939708e20031ac31c4a60734302e2d4aa0c685f7554aa4f293d234f','Archived GMAC driver changed')
+ for p,h in audit['built'].items():trace.require(sha256(stage/p)==h,'Stage A changed')
+ files=[p for folder in ('pds/wan_dhcp_freshness','pds/wan_dhcp_diagnostic','pds/network_supervisor','pds/gmac_dma_corrected','drivers/gmac0','router-core') for p in (ROOT/folder).rglob('*') if p.is_file() and 'target' not in p.parts]
+ files += [ROOT/p for p in ('config/router-v1.json','scripts/build-router-wan-dhcp','scripts/build-rawio-dma-restart','pds/preflight_fault_id/src/poll.c','scripts/wan_profile.py','scripts/wan_stack_profile.py','scripts/router_config.py','scripts/network_uboot.py','scripts/iodomain_fixed_build.py','firmware/vccio1-boot-policy.dtsi','scripts/image.py','scripts/handoff_trace.py')]
+ if GATED:
+  files += [ROOT/'scripts/lan_gated_profile.py',ROOT/'pds/router_gated/main.rs']
+  trace.require(sha256(ROOT/'out/router-wan-dhcp-repair/r5s-wan-dhcp.img')=='7395e3de7c30d1038d68c40c71a043a5b54cfebfee0f8dc6b5ade78086619927','Working WAN baseline differs')
+ inputs={str(p.relative_to(ROOT)):sha256(p) for p in sorted(files)}
+ identity=hashlib.sha256(json.dumps(dict(inputs=inputs,dma=audit['build_id']),sort_keys=True).encode()).hexdigest()[:32]
+ ns=runpy.run_path(str(ROOT/'scripts/build-rawio-dma-restart'));build=ns['build_pd'];build.__globals__['BASE']=BASE
+ sdk=ROOT/'out/native-net/work/microkit/release/microkit-sdk-2.4.0'
+ shutil.copyfile(stage/'aarch64-sel4.json',BASE/'aarch64-sel4.json')
+ out=BASE/'wan-dhcp';out.mkdir(exist_ok=True)
+ gated=('lan-gated',) if GATED else ()
+ extra={'queue.rs':ROOT/'pds/gmac_dma_corrected/src/queue.rs','shared.rs':ROOT/'pds/gmac_probe/src/shared.rs'}
+ shutil.copyfile(build('pds/wan_dhcp_freshness','wan-app',sdk,extra=extra,features=('quiet',*gated)),out/'probe.elf')
+ supervisor=ROOT/'pds/network_supervisor'
+ shutil.copyfile(build(str(supervisor.relative_to(ROOT)),'wan-supervisor',sdk,extra={'policy.rs':ROOT/'pds/network_supervisor/src/wan_policy.rs','main.rs':ROOT/'pds/wan_dhcp_diagnostic/supervisor.rs','milestones.rs':ROOT/'pds/wan_dhcp_diagnostic/milestones.rs','poll_deadline.rs':ROOT/'pds/wan_dhcp_diagnostic/poll_deadline.rs'},features=gated),out/'heartbeat.elf')
+ shutil.copyfile(build('pds/gmac_dma_corrected','wan-driver',sdk,raw=True,features=('quiet',*gated)),out/'driver.elf')
+ if GATED:
+  from lan_gated_profile import system,PROFILE,SERVICES,GATE
+  shutil.copyfile(build('pds/wan_dhcp_freshness','router-policy',sdk,extra=dict(extra,**{'main.rs':ROOT/'pds/router_gated/main.rs'})),out/'router.elf')
+ for name in ('health.elf','loader.elf','sel4.elf','initialiser.elf','monitor.elf'):shutil.copyfile(stage/'gmac-rawio'/name,out/name)
+ xml=(stage/'gmac-rawio/system.system').read_text().replace('name="probe"',f'name="wan" stack_size="{WAN_STACK:#x}"').replace('name="heartbeat" priority="110" budget="100"','name="heartbeat" priority="110" budget="200"')
+ if GATED:xml=system(xml)
+ (out/'system.system').write_text(xml)
+ payload=out/'loader.img';trace.run([sdk/'bin/microkit',out/'system.system','--board','nanopi_r5s_trace','--config','debug','--search-path',out,'-o',payload,'-r',out/'microkit-report.txt'],BASE/'logs/wan-microkit.log')
+ check_stack(out/'system.system',out/'microkit-report.txt')
+ lock=json.loads((ROOT/'sources.lock').read_text());trace.clone_inputs(BASE/'work',lock)
+ early=runpy.run_path(str(ROOT/'scripts/build-native-net'))['early_header']()
+ trace.build_uboot(BASE,'wan-dhcp',payload,0,early)
+ relative='microkit/build/nanopi_r5s_trace/debug/sel4/build/gen_headers/plat/machine/devices_gen.h';target=BASE/'work'/relative;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/'out/native-net/work'/relative,target)
+ layout=trace.layout(BASE,sdk,payload,out/'loader.elf',out,allowed_mmio=[0xfe2a0000,0xfe2a1000,0xfdc60000,0xfdc20000,0xfdd20000,0xfdd00000,0xfdd60000]+([0xfe750000] if GATED else []))
+ for name,start,end in layout['loader_regions']:trace.require(not(0x24000000<end and start<0x24040000),'DMA pool overlaps '+name)
+ trace.require(sum(o['physical'] is not None and 0x24000000<=o['physical']<0x24040000 for o in layout['capdl_objects'])==64,'Pool capability count changed')
+ policy=out/'boot.txt';policy.write_text('Native WAN DHCPv4 client, ARP address-conflict checks and five gateway ICMP probes per lease.\nNo DHCP server, NAT, router, WAN administration or raw diagnostic responder.\nSYS words distinguish DHCP transaction progress, a bound lease, gateway ARP, and a validated Echo Reply.\nHardware untested.\n')
+ if GATED:
+  policy.write_text('GMAC0 DHCP WAN. WAN case LED on negotiated link and DMA completion activity. Both PCIe LANs administratively unavailable: no controller mappings or bus-master enable. No physical LAN DHCP or forwarding.\n')
+ firmware=out/'u-boot-rockchip.bin'
+ m=dict(corrections=["vccio1-boot-policy","resolved-phy","bounded-startup","snapshot-before-time","cpu-owned-cache-exercise","bounded-wan-poll-path","wan-stack-and-deadline-witness","rtl8211f-common-ability-and-dma-reset"],format=7,profile='wan-dhcp',hardware_tested=False,dma_enabled=True,ethernet_enabled=True,diagnostics=SPEC,pool=audit['pool'],build_id=identity,configuration=config,services=['wan-dhcp-client','arp','finite-gateway-icmp'],load_address=0x30000000,ram=[0x20000000,0x40000000],loader=dict(size=payload.stat().st_size,sha256=sha256(payload)),uboot=dict(size=firmware.stat().st_size,sha256=sha256(firmware)),policy_sha256=sha256(policy),lock_sha256=sha256(ROOT/'sources.lock'),sources=lock['sources'])
+ if GATED:m.update(profile=PROFILE,services=SERVICES,lan_dma=GATE)
+ image=BASE/('r5s-router.img' if GATED else 'r5s-wan-dhcp.img')
+ assemble_files(image,firmware,[(payload,'loader.img'),(policy,'boot.txt')],m,sha256(payload)+sha256(firmware))
+ trace.require(verify(image)==m,'WAN image verification failed')
+ for p,h in inputs.items():trace.require(sha256(ROOT/p)==h,'Build input changed: '+p)
+ (BASE/'source-hashes.json').write_text(json.dumps(inputs,indent=2)+'\n');(BASE/'layout-report.json').write_text(json.dumps(layout,indent=2)+'\n')
+ (BASE/'wan-manifest.json').write_text(json.dumps(m,indent=2)+'\n')
+ built={image.name:sha256(image)}
+ (BASE/'SHA256SUMS').write_text(''.join(f'{v}  {k}\n' for k,v in built.items()))
+ (BASE/'ARTIFACTS.json').write_text(json.dumps(dict(built=built,hardware_tested=False,gmac_driver_sha256=sha256(out/'driver.elf')),indent=2)+'\n')
+ print(json.dumps(built))
+if __name__=='__main__':main()

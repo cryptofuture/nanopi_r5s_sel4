@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+import gzip,json,shutil,sys,tarfile,tempfile
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1];BASE=ROOT/'out/iodomain-observe';sys.path.insert(0,str(ROOT/'scripts'))
+from policy import sha256
+from image import verify
+
+def main():
+ image=BASE/'r5s-iodomain-observe.img';manifest=verify(image)
+ assert sha256(image)==sha256(BASE/'r5s-iodomain-observe.reproduced.img')
+ assert manifest['registry_sha256']==sha256(BASE/'fault-registry.json')
+ assert manifest['observation_spec_sha256']==sha256(BASE/'observation-spec.json')
+ for path,digest in json.loads((BASE/'source-hashes.json').read_text()).items():assert sha256(ROOT/path)==digest,path
+ with tempfile.TemporaryDirectory(dir=BASE) as tmp:
+  root=Path(tmp)/'iodomain-observe';root.mkdir()
+  def copy(p,d):d.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(p,d)
+  def tree(p,d):
+   for f in p.rglob('*'):
+    if f.is_file() and not set(f.parts)&{'target','__pycache__','.git'}:copy(f,d/f.relative_to(p))
+  names=['r5s-iodomain-observe.img','r5s-iodomain-observe.manifest.json','ARTIFACTS.json','preserved.json','fault-registry.json','fault-codes.md','observation-spec.json','observation-codes.md','observation-audit.md','operator.md','source-hashes.json','layout-report.json','handoff-layout.json','compiled-link.c','link.patch']
+  for name in names:copy(BASE/name,root/name)
+  for p in (ROOT/'scripts').iterdir():
+   if p.is_file() and (p.suffix=='.py' or p.name in ('flash-sd','verify-image')):copy(p,root/'scripts'/p.name)
+  copy(ROOT/'scripts/check-router-deps',root/'scripts/check-preflight-deps')
+  copy(ROOT/'protocol/diagnostics-v2.json',root/'protocol/diagnostics-v2.json')
+  for name in ['sources.lock','router-dependencies.lock.json']:copy(ROOT/name,root/'sources'/name)
+  for name in ['pds/iodomain_observe','drivers/gmac0']:tree(ROOT/name,root/'sources'/name)
+  for name in ['build-iodomain-observe','generate-iodomain-table','audit-iodomain-observe','package-iodomain-observe','env']:copy(ROOT/'scripts'/name,root/'sources/scripts'/name)
+  for name in ['test_iodomain_observe.py','iodomain_observe_test.rs']:copy(ROOT/'tests'/name,root/'sources/tests'/name)
+  for name in ['drivers/misc/rockchip-io-domain.c','cmd/r5sboot-trace.c']:copy(BASE/'work/u-boot'/name,root/'patched-uboot'/name)
+  for p in (BASE/'iodomain-observe').iterdir():
+   if p.is_file():copy(p,root/'build-evidence'/p.name)
+  for name in ['u-boot.map','idbloader.img','spl/u-boot-spl.bin','u-boot.dtb','u-boot.itb']:copy(BASE/'iodomain-observe/build'/name,root/'build-evidence'/name)
+  for p in (BASE/'logs').iterdir():
+   if p.is_file() and p.name!='package.log':copy(p,root/'logs'/p.name)
+  files=sorted(p for p in root.rglob('*') if p.is_file())
+  sums=''.join(f'{sha256(p)}  {p.relative_to(root)}\n' for p in files);(root/'SHA256SUMS').write_text(sums);(BASE/'bundle-SHA256SUMS').write_text(sums)
+  archive=BASE/'r5s-iodomain-observe-handoff.tar.gz';assert not archive.exists(),'Preserve existing bundle'
+  with archive.open('wb') as raw,gzip.GzipFile(filename='',mode='wb',fileobj=raw,mtime=0) as compressed,tarfile.open(fileobj=compressed,mode='w') as tar:
+   for p in sorted(root.rglob('*')):
+    if not p.is_file():continue
+    info=tar.gettarinfo(p,arcname=str(p.relative_to(Path(tmp))));info.uid=info.gid=0;info.uname=info.gname='';info.mtime=0;info.mode=0o644
+    with p.open('rb') as f:tar.addfile(info,f)
+  archive.with_name(archive.name+'.sha256').write_text(f'{sha256(archive)}  {archive.name}\n')
+  print(sha256(image));print(sha256(archive))
+if __name__=='__main__':main()

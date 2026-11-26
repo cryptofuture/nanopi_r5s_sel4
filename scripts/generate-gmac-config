@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+import json
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1]
+def main():
+ d=json.loads((ROOT/'out/gmac-bringup/gmac0-resolved.json').read_text())
+ if d['mmio']!=[[0xfe2a0000,65536]] or d['phy']['mode']!='rgmii' or d['reset']['pin']!=21 or not d['reset']['active_low'] or d['reset']['timing_us']!=[0,15000,50000]:raise ValueError('Unsupported captured platform configuration')
+ writes=[]
+ if (d['clock_direction']!='output' or [v['args'] for v in d['clocks']]!=[[v] for v in (386,389,389,184,180,181,389,185,172,171)] or
+     any(v['node']!='/clock-controller@fdd20000' for v in d['clocks']) or
+     [v['args'] for v in d['assigned_clocks']]!=[[389],[386]] or
+     [v['args'] for v in d['assigned_parents']]!=[[387],[182]] or d['assigned_rates']!=[0,125000000] or
+     d['resets']!=[dict(node='/clock-controller@fdd20000',args=[215])]):raise ValueError('Unsupported clock/reset provider configuration')
+ if d['grf'][0][0]!=0xfdc60000 or d['reset']['reg'][0][0]!=0xfdd60000:raise ValueError('GPIO/GRF address mismatch')
+ for name,address in [('cru',0xfdd20000),('pmucru',0xfdd00000),('pmugrf',0xfdc20000)]:
+  if d['providers'][name]['reg'][0][0]!=address:raise ValueError('Provider address mismatch')
+ expected={'pmuio2-supply':3300000,'vccio1-supply':3300000,'vccio4-supply':1800000,'vccio6-supply':1800000}
+ for name,voltage in expected.items():
+  supply=next(v for v in d['io_supplies'] if v['property']==name)
+  if supply['minimum']!=voltage or supply['maximum']!=voltage or not supply['always_on']:raise ValueError('IO fixed-supply declaration changed')
+ def add(region,offset,mask,value,reason):
+  if value&~mask:raise ValueError('Unmasked write')
+  writes.append(dict(region=region,offset=offset,mask=mask,value=value,reason=reason))
+ for p in d['pins']:
+  if p['bank']!=2:raise ValueError('Unexpected RGMII bank')
+  pin=p['pin'];shift=pin%4*4;add(1,0x20+pin//4*4,15<<shift,p['mux']<<shift,p['node'])
+  if pin not in range(32) or p['mux'] not in range(16):raise ValueError('Invalid pinmux')
+  if 'bias-disable' not in p['config']:raise ValueError('Unknown RGMII bias')
+  add(1,0x90+pin//8*4,3<<(pin%8*2),0,'bias-disable')
+  if 'drive-strength' in p['config']:
+   level=p['config']['drive-strength'][0]
+   if level not in range(8):raise ValueError('Unsupported drive level')
+   value=(1<<(level+1))-1;shift=pin%2*8
+   add(1,0x240+pin//2*4,255<<shift,(value&255)<<shift,'captured drive level')
+   if pin==8:add(1,0x848,255,value>>6,'GPIO2B0 split drive')
+ add(1,0x380,0x7f7f,(d['delay']['rx']<<8)|d['delay']['tx'],'captured MAC delays')
+ add(1,0x384,0x73,0x13,'RGMII + RX/TX MAC delay enable')
+ add(2,0x14,0xf0,0,'GPIO0_C5 reset mux')
+ add(2,0x28,3<<10,0,'GPIO0_C5 no pull')
+ header='#ifndef R5S_GMAC_CONFIG_H\n#define R5S_GMAC_CONFIG_H\n'
+ header+=f'#define EXPECT_PHY_ID 0x{d["phy"]["id"]:08x}u\n#define PHY_ADDRESS {d["phy"]["address"]}u\n'
+ header+='struct setup_write {unsigned region,offset,mask,value;};\nstatic const struct setup_write setup[] = {\n'
+ header+=''.join(f'{{{w["region"]},0x{w["offset"]:x},0x{w["mask"]:x},0x{w["value"]:x}}},\n' for w in writes)+'};\n#endif\n'
+ (ROOT/'drivers/gmac0/link-config.h').write_text(header)
+ (ROOT/'out/gmac-bringup/platform-writes.json').write_text(json.dumps(writes,indent=2)+'\n')
+if __name__=='__main__':main()

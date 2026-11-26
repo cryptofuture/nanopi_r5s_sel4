@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+import difflib,hashlib,json,os,runpy,shutil,sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import handoff_trace as trace
+from image import assemble_files,verify
+from policy import sha256
+from diagnostics import SPEC
+from preflight_repair_profile import PROFILE,DEADLINES
+ROOT=trace.ROOT;BASE=ROOT/'out/preflight-repair-v2'
+
+def main():
+ (BASE/'logs').mkdir(parents=True,exist_ok=True);work=BASE/'work';work.mkdir(exist_ok=True)
+ preserved=json.loads((BASE/'preserved.json').read_text())
+ for p,h in preserved.items():trace.require(sha256(ROOT/p)==h,'Preserved input changed: '+p)
+ paths=[p for p in (ROOT/'pds/preflight_repair_v2').rglob('*') if p.is_file() and 'target' not in p.parts]
+ paths += [ROOT/p for p in ('drivers/gmac0/link.c','drivers/gmac0/link.h','drivers/gmac0/link-config.h','drivers/gmac0/mdio.c','drivers/gmac0/mdio.h','scripts/build-preflight-repair-v2','scripts/preflight_repair_profile.py','scripts/image.py','protocol/diagnostics-v2.json')]
+ inputs={str(p.relative_to(ROOT)):sha256(p) for p in sorted(paths)}
+ identity=hashlib.sha256(json.dumps(inputs,sort_keys=True).encode()).hexdigest()[:32]
+ idpath=BASE/'identity.rs';idpath.write_text('pub const ID:[u32;4]=['+','.join(str(int(identity[i:i+8],16)) for i in range(0,32,8))+'];\n')
+ sdk=ROOT/'out/native-net/work/microkit/release/microkit-sdk-2.4.0'
+ shutil.copyfile(ROOT/'out/native-net/aarch64-sel4.json',BASE/'aarch64-sel4.json')
+ output=BASE/PROFILE;output.mkdir(exist_ok=True)
+ def build(name,supervisor):
+  project=work/name;shutil.copytree(ROOT/'pds/preflight_repair_v2',project,dirs_exist_ok=True,ignore=shutil.ignore_patterns('target'));shutil.copyfile(idpath,project/'src/identity.rs')
+  p=project/'Cargo.toml';p.write_text(p.read_text().replace('../../vendor/rust-sel4/crates/sel4-microkit',str(ROOT/'vendor/rust-sel4/crates/sel4-microkit')).replace('../../vendor/rust-sel4/crates/sel4"',str(ROOT/'vendor/rust-sel4/crates/sel4')+'"'))
+  args=['cargo','build','--manifest-path',p,'--release','--locked','-Zbuild-std=core,alloc,compiler_builtins','-Zbuild-std-features=compiler-builtins-mem','-Zjson-target-spec','--target',BASE/'aarch64-sel4.json']
+  if supervisor:args+=['--features','supervisor']
+  trace.run(args,BASE/f'logs/{name}.log',env=dict(os.environ,SEL4_INCLUDE_DIRS=str(sdk/'board/nanopi_r5s_trace/debug/include'),R5S_PROJECT_ROOT=str(ROOT),CARGO_NET_OFFLINE='true'))
+  return project/'target/aarch64-sel4/release/r5s-heartbeat.elf'
+ shutil.copyfile(build('fixed-driver',False),output/'driver.elf');shutil.copyfile(build('fixed-supervisor',True),output/'heartbeat.elf');shutil.copyfile(ROOT/'out/native-net/health.elf',output/'health.elf')
+ xml=(ROOT/'out/gmac-rawio/gmac-dma-preflight/system.system').read_text()
+ for line in ('<memory_region name="queues" size="0x8000" />\n','<memory_region name="probe_status" size="0x1000" />\n'):xml=xml.replace(line,'')
+ (output/'system.system').write_text(xml)
+ board=sdk/'board/nanopi_r5s_trace/debug/elf'
+ runtime={}
+ for name in ('loader','sel4','initialiser','monitor'):
+  p=board/f'{name}.elf';trace.require(sha256(p)==sha256(ROOT/f'out/native-net/runtime-baseline-v2/{name}.elf'),'SDK component changed');shutil.copyfile(p,output/p.name);runtime[name]=sha256(p)
+ payload=output/'loader.img';trace.run([sdk/'bin/microkit',output/'system.system','--board','nanopi_r5s_trace','--config','debug','--search-path',output,'-o',payload,'-r',output/'microkit-report.txt'],BASE/'logs/microkit.log')
+ lock=json.loads((ROOT/'sources.lock').read_text());trace.clone_inputs(work,lock)
+ old=runpy.run_path(str(ROOT/'scripts/build-native-net'));trace.build_uboot(BASE,PROFILE,payload,0,old['early_header']())
+ relative='microkit/build/nanopi_r5s_trace/debug/sel4/build/gen_headers/plat/machine/devices_gen.h';target=work/relative;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/'out/native-net/work'/relative,target)
+ layout=trace.layout(BASE,sdk,payload,output/'loader.elf',output,allowed_mmio=[0xfe2a0000,0xfe2a1000,0xfdc60000,0xfdc20000,0xfdd20000,0xfdd00000,0xfdd60000])
+ for name,start,end in layout['loader_regions']:trace.require(not(0x24000000<end and start<0x24040000),'Pool overlaps '+name)
+ for address in range(0x24000000,0x24040000,4096):trace.require(sum(o['physical']==address for o in layout['capdl_objects'])==1,f'Pool frame missing/duplicate {address:x}')
+ report=(output/'microkit-report.txt').read_text();trace.require("* Slot: 3\n\t\t\t-> Object: 'pud_gmac'" in report,'Own VSpace cap mismatch')
+ generated=list((work/'fixed-driver/target').rglob('link-fixed.c'));trace.require(len(generated)==1,'Missing actual compiled link source');(BASE/'compiled-link.c').write_bytes(generated[0].read_bytes())
+ (BASE/'link.patch').write_text(''.join(difflib.unified_diff((ROOT/'drivers/gmac0/link.c').read_text().splitlines(True),generated[0].read_text().splitlines(True),fromfile='a/link.c',tofile='b/link-fixed.c')))
+ policy=output/'boot.txt';policy.write_text('DMA-disabled consolidated preflight repair candidate. Real Rust own-VSpace cache calls on CPU-owned Normal-WB RAM; no packet/DHCP/proof path.\nWAIT: initialization or unresolved/absent link. READY: cache, inactive DMA, valid fresh link and essential health. FAULT: first fatal check or bounded startup/liveness failure. IO_VERIFIED unreachable.\nNo storage writes; no automatic reboot or promotion. Hardware untested.\n')
+ firmware=output/'u-boot-rockchip.bin';m=dict(format=8,profile=PROFILE,hardware_tested=False,dma_enabled=False,packet_io=False,io_verified_allowed=False,diagnostics=SPEC,status_abi=2,deadlines=DEADLINES,pool=dict(virtual=0x60000000,physical=0x24000000,size=0x40000,attributes='Normal-WB',cache_line=64,page_size=4096,owner='gmac'),build_id=identity,load_address=0x30000000,ram=[0x20000000,0x40000000],loader=dict(size=payload.stat().st_size,sha256=sha256(payload)),uboot=dict(size=firmware.stat().st_size,sha256=sha256(firmware)),policy_sha256=sha256(policy),lock_sha256=sha256(ROOT/'sources.lock'),sources=lock['sources'])
+ images=[BASE/('r5s-gmac-dma-preflight-repair-v2'+suffix+'.img') for suffix in ('','.reproduced')]
+ for image in images:
+  if image.exists():trace.require(verify(image)==m,'Preserve previous candidate before changed rebuild')
+  else:assemble_files(image,firmware,[(payload,'loader.img'),(policy,'boot.txt')],m,sha256(payload)+sha256(firmware))
+ trace.require(sha256(images[0])==sha256(images[1]),'Assemblies differ')
+ for p,h in inputs.items():trace.require(sha256(ROOT/p)==h,'Build input changed: '+p)
+ for p,h in preserved.items():trace.require(sha256(ROOT/p)==h,'Preserved artifact changed: '+p)
+ (BASE/'source-hashes.json').write_text(json.dumps(inputs,indent=2)+'\n');(BASE/'layout-report.json').write_text(json.dumps(layout,indent=2)+'\n');(BASE/'r5s-gmac-dma-preflight-repair-v2.manifest.json').write_text(json.dumps(m,indent=2)+'\n')
+ (BASE/'ARTIFACTS.json').write_text(json.dumps(dict(built={images[0].name:sha256(images[0])},hardware_tested=False,assembly_reproducible=True,runtime_unchanged=runtime,preserved=preserved,build_id=identity),indent=2)+'\n')
+ (BASE/'SHA256SUMS').write_text(f'{sha256(images[0])}  {images[0].name}\n');print(sha256(images[0]))
+if __name__=='__main__':main()

@@ -1,0 +1,25 @@
+[package]
+name = "r5s-wan-ingress-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["lan-gated"]
+lan-gated = []
+b51-udp = []
+lan-tx-stats = ["b51-udp"]
+lan-status = ["b51-udp"]
+shared-wan = ["lan-status"]
+
+[dev-dependencies]
+r5s-router-core = { path = "../../router-core" }
+smoltcp = { version = "=0.12.0", default-features = false, features = ["medium-ethernet","proto-ipv4","socket-dhcpv4","socket-icmp"] }
+
+[[test]]
+name = "wan_ingress"
+path = "../wan_lan_ingress.rs"
+
+[[test]]
+name = "wan_retry"
+path = "../wan_retry.rs"

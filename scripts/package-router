@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+import gzip,hashlib,json,os,shutil,sys,tarfile,tempfile
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1];BASE=ROOT/'out/router'
+sys.path.insert(0,str(ROOT/'scripts'))
+from image import verify
+from policy import sha256
+
+def copy(source,target):
+ target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(source,target)
+
+def tree(source,target):
+ for p in source.rglob('*'):
+  if p.is_file() and not set(p.parts)&{'target','__pycache__','.git'}:copy(p,target/p.relative_to(source))
+
+def archive(root,output,executable_scripts=False):
+ temporary=output.with_suffix(output.suffix+'.new')
+ with temporary.open('wb') as raw,gzip.GzipFile(filename='',mode='wb',fileobj=raw,mtime=0) as compressed,tarfile.open(fileobj=compressed,mode='w') as tar:
+  for p in sorted(root.rglob('*')):
+   if not p.is_file():continue
+   info=tar.gettarinfo(p,arcname=str(p.relative_to(root)));info.uid=info.gid=0;info.uname=info.gname='';info.mtime=0;info.mode=0o755 if executable_scripts and p.stat().st_mode & 0o111 else 0o644
+   with p.open('rb') as f:tar.addfile(info,f)
+ if output.exists():
+  if sha256(output)!=sha256(temporary):temporary.unlink();raise ValueError('Preserve existing archive before changed packaging: '+str(output))
+  temporary.unlink()
+ else:temporary.rename(output)
+ output.with_name(output.name+'.sha256').write_text(f'{sha256(output)}  {output.name}\n')
+
+def main():
+ audit=json.loads((BASE/'ARTIFACTS.json').read_text())
+ stage=ROOT/'out/gmac-rawio';prior=json.loads((stage/'ARTIFACTS.json').read_text())
+ for name,digest in prior['built'].items():
+  if sha256(stage/name)!=digest:raise ValueError('Stage A image changed')
+  if (BASE/name).exists() and sha256(BASE/name)!=digest:raise ValueError('Preserve stale Stage A copy')
+  if not (BASE/name).exists():copy(stage/name,BASE/name)
+  audit['built'][name]=digest
+ audit['preserved']=prior['preserved']
+ audit['status']={'A':'coded, built, host-tested; real cache calls and external packet exchange pending board tests','B':'coded, built; parsers/config host-tested; native DHCP adapter hardware-untested','C':'native PCIe/RTL8125 not implemented','D':'incomplete host NAPT/DHCP core only; no router image','E':'not implemented'}
+ (BASE/'ARTIFACTS.json').write_text(json.dumps(audit,indent=2)+'\n')
+ (BASE/'SHA256SUMS').write_text(''.join(f'{v}  {k}\n' for k,v in sorted(audit['built'].items())))
+ (BASE/'manifests').mkdir(exist_ok=True)
+ for name in audit['built']:(BASE/'manifests'/(name+'.json')).write_text(json.dumps(verify(BASE/name),indent=2)+'\n')
+ for p,h in audit['preserved'].items():
+  if sha256(ROOT/p)!=h:raise ValueError('Preserved artifact changed: '+p)
+ for base in (BASE,ROOT/'out/gmac-rawio'):
+  for p,h in json.loads((base/'source-hashes.json').read_text()).items():
+   if sha256(ROOT/p)!=h:raise ValueError('Rebuild changed source: '+p)
+ with tempfile.TemporaryDirectory(dir=BASE) as directory:
+  staging=Path(directory);root=staging/'router';root.mkdir()
+  for name,digest in audit['built'].items():
+   if sha256(BASE/name)!=digest:raise ValueError('Image changed')
+   verify(BASE/name);copy(BASE/name,root/name)
+   copy(BASE/'manifests'/(name+'.json'),root/'manifests'/(name+'.json'))
+  for name in ('ARTIFACTS.json','layout-report.json','dma-map.json','capability-audit.json','pcie-evidence.json','source-hashes.json','wan-manifest.json'):copy(BASE/name,root/name)
+  copy(ROOT/'out/gmac-rawio/layout-report.json',root/'gmac-layout-report.json')
+  copy(ROOT/'out/gmac-rawio/source-hashes.json',root/'gmac-source-hashes.json')
+  for p in (ROOT/'scripts').iterdir():
+   if p.is_file() and (p.suffix=='.py' or p.name in ('flash-sd','verify-image','check-router-deps')):copy(p,root/'scripts'/p.name)
+  for name in ('net-peer','wan-observer'):copy(ROOT/'tools'/name,root/'tools'/name)
+  tree(ROOT/'tools/netprobe',root/'tools/netprobe')
+  for name in ('logs','references','dependency-cache','patches'):tree(BASE/name,root/name)
+  tree(ROOT/'out/gmac-rawio/logs',root/'logs/gmac-build')
+  for profile,source in [('gmac-dma-preflight',ROOT/'out/gmac-rawio/gmac-dma-preflight'),('gmac-rawio',ROOT/'out/gmac-rawio/gmac-rawio'),('wan-dhcp',BASE/'wan-dhcp')]:
+   for p in source.iterdir():
+    if p.is_file():copy(p,root/'profiles'/profile/p.name)
+   copy(source/'build/u-boot.map',root/'profiles'/profile/'u-boot.map')
+  for name in ('docs','protocol','config','boards','pds/gmac_dma','pds/gmac_probe','pds/wan_dhcp','pds/gmac_supervisor','pds/net_probe','pds/diagnostics','drivers/gmac0','router-core','tests','scripts'):tree(ROOT/name,root/'sources'/name)
+  for name in ('sources.lock','router-dependencies.lock.json','requirements.lock','README.md'):copy(ROOT/name,root/'sources'/name)
+  for p in (ROOT/'docs').glob('router-*.md'):copy(p,root/'docs'/p.name)
+  copy(ROOT/'docs/diagnostics-v2.md',root/'docs/diagnostics-v2.md')
+  tree(ROOT/'protocol',root/'protocol')
+  copy(ROOT/'docs/router-protocols.md',BASE/'protocol-support-matrix.md');copy(BASE/'protocol-support-matrix.md',root/'protocol-support-matrix.md')
+  files=sorted(p for p in root.rglob('*') if p.is_file())
+  (root/'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.relative_to(root)}\n' for p in files))
+  archive(staging,BASE/'r5s-router-handoff.tar.gz')
+ with tempfile.TemporaryDirectory(dir=BASE) as directory:
+  staging=Path(directory)
+  for name in ('net-peer','wan-observer'):copy(ROOT/'tools'/name,staging/'tools'/name)
+  tree(ROOT/'tools/netprobe',staging/'tools/netprobe')
+  copy(ROOT/'docs/router-operator.md',staging/'docs/router-operator.md')
+  archive(staging,BASE/'router-test-tools.tar.gz')
+ print(json.dumps({'bundle':str(BASE/'r5s-router-handoff.tar.gz'),'sha256':sha256(BASE/'r5s-router-handoff.tar.gz')},indent=2))
+if __name__=='__main__':main()

@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+import gzip,json,shutil,sys,tarfile,tempfile
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1];BASE=ROOT/'out/preflight-repair-v2'
+sys.path.insert(0,str(ROOT/'scripts'))
+from policy import sha256
+from image import verify
+
+def copy(source,target):target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(source,target)
+def tree(source,target):
+ for p in source.rglob('*'):
+  if p.is_file() and not set(p.parts)&{'target','__pycache__','.git'}:copy(p,target/p.relative_to(source))
+
+def main():
+ a=json.loads((BASE/'ARTIFACTS.json').read_text());image=BASE/'r5s-gmac-dma-preflight-repair-v2.img'
+ for p,h in a['preserved'].items():assert sha256(ROOT/p)==h,p
+ for p,h in json.loads((BASE/'source-hashes.json').read_text()).items():assert sha256(ROOT/p)==h,p
+ assert sha256(image)==a['built'][image.name];verify(image)
+ assert sha256(BASE/'r5s-gmac-dma-preflight-repair-v2.reproduced.img')==sha256(image)
+ with tempfile.TemporaryDirectory(dir=BASE) as directory:
+  stage=Path(directory);root=stage/'preflight-repair-v2';root.mkdir()
+  for name in ('r5s-gmac-dma-preflight-repair-v2.img','r5s-gmac-dma-preflight-repair-v2.manifest.json','ARTIFACTS.json','preserved.json','fault-audit-v2.md','source-diff.md','RESULTS.md','layout-report.json','source-hashes.json','status-abi.json','capability-audit.json','differential.json','dma-map.json','compiled-link.c','link.patch','repair.patch','operator.md','comparison-to-first-repair.json','auxiliary-led-evidence.json'):
+   copy(BASE/name,root/name)
+  for p in (ROOT/'scripts').iterdir():
+   if p.is_file() and (p.suffix=='.py' or p.name in ('flash-sd','verify-image')):copy(p,root/'scripts'/p.name)
+  copy(ROOT/'scripts/check-router-deps',root/'scripts/check-preflight-deps')
+  copy(ROOT/'docs/preflight-repair-v2.md',root/'INSTALL.md')
+  copy(ROOT/'protocol/diagnostics-v2.json',root/'protocol/diagnostics-v2.json')
+  for p in (BASE/'logs').rglob('*'):
+   if p.is_file() and p.name!='package.log' and not p.name.startswith('bundle-validation'):copy(p,root/'logs'/p.relative_to(BASE/'logs'))
+  output=BASE/'gmac-dma-preflight-repair-v2'
+  for p in output.iterdir():
+   if p.is_file():copy(p,root/'build-evidence'/p.name)
+  for name in ('u-boot.map','simple-bin.map','idbloader.img','spl/u-boot-spl.bin','u-boot.dtb','u-boot.itb'):copy(output/'build'/name,root/'build-evidence'/name)
+  for name in ('pds/preflight_repair_v2','pds/preflight_fixed','pds/gmac_dma','pds/gmac_supervisor','drivers/gmac0'):tree(ROOT/name,root/'sources'/name)
+  for p in (ROOT/'tests').glob('preflight*'):copy(p,root/'sources/tests'/p.name)
+  copy(ROOT/'tests/gmac_link_test.c',root/'sources/tests/gmac_link_test.c');copy(ROOT/'tests/test_preflight_fix.py',root/'sources/tests/test_preflight_fix.py')
+  for name in ('build-preflight-repair-v2','audit-preflight-repair-v2','package-preflight-repair-v2','env'):copy(ROOT/'scripts'/name,root/'sources/scripts'/name)
+  for name in ('sources.lock','router-dependencies.lock.json'):copy(ROOT/name,root/'sources'/name)
+  old=ROOT/'out/gmac-rawio/gmac-dma-preflight'
+  for name in ('system.system','microkit-report.txt','r5s_payload.h','uboot.config'):copy(old/name,root/'failed-profile-evidence'/name)
+  for name,p in [('sel4-vspace.c',ROOT/'out/native-net/work/sel4/src/arch/arm/64/kernel/vspace.c'),('microkit-capdl-builder.rs',ROOT/'out/native-net/work/microkit/tool/microkit/src/capdl/builder.rs'),('rust-microkit-entry.rs',ROOT/'vendor/rust-sel4/crates/sel4-microkit/src/entry.rs'),('rust-aarch64-syscalls.rs',ROOT/'vendor/rust-sel4/crates/sel4/sys/src/syscalls/helpers/arch/aarch64.rs'),('uboot-realtek.c',ROOT/'vendor/u-boot/drivers/net/phy/realtek.c')]:copy(p,root/'source-reference'/name)
+  generated=list((BASE/'work/fixed-driver/target').glob('aarch64-sel4/release/build/sel4-sys/*/out/invocations.rs'))
+  assert len(generated)==1
+  copy(generated[0],root/'source-reference/generated-rust-invocations.rs')
+  include=ROOT/'out/native-net/work/microkit/release/microkit-sdk-2.4.0/board/nanopi_r5s_trace/debug/include'
+  for name in ('sel4/errors.h','kernel/gen_config.h','sel4/sel4_arch/interfaces/sel4_client.h'): 
+   if (include/name).is_file():copy(include/name,root/'source-reference'/name)
+  files=sorted(p for p in root.rglob('*') if p.is_file())
+  (root/'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.relative_to(root)}\n' for p in files))
+  archive=BASE/'r5s-preflight-repair-v2-handoff.tar.gz';temporary=archive.with_suffix('.gz.new')
+  with temporary.open('wb') as raw,gzip.GzipFile(filename='',mode='wb',fileobj=raw,mtime=0) as compressed,tarfile.open(fileobj=compressed,mode='w') as tar:
+   for p in sorted(root.rglob('*')):
+    if not p.is_file():continue
+    info=tar.gettarinfo(p,arcname=str(p.relative_to(stage)));info.uid=info.gid=0;info.uname=info.gname='';info.mtime=0;info.mode=0o644
+    with p.open('rb') as source:tar.addfile(info,source)
+  if archive.exists():
+   if sha256(archive)!=sha256(temporary):temporary.unlink();raise ValueError('Preserve existing bundle before changed packaging')
+   temporary.unlink()
+  else:temporary.rename(archive)
+  archive.with_name(archive.name+'.sha256').write_text(f'{sha256(archive)}  {archive.name}\n')
+  print(json.dumps(dict(bundle=str(archive),sha256=sha256(archive),image_sha256=sha256(image),hardware_tested=False),indent=2))
+if __name__=='__main__':main()

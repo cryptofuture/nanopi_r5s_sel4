@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Read the NanoPi network diagnostic over a directly connected subnet."""
+import argparse
+import errno
+from ipaddress import IPv4Address
+import json
+import math
+import secrets
+import socket
+import struct
+import sys
+import time
+from b51_status import describe
+
+PORT = 48125
+HEADER = struct.Struct("!4sHH8s")
+# Schema 7 (TSO builds) appends per-port TSO diagnostics; schema 6
+# (zero-copy builds) appends pool diagnostics; schema 5 keeps 248.
+WORD_SIZES = (304, 268, 248, 336)
+NETWORK_VERSIONS = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+
+
+def words_struct(count):
+    return struct.Struct(f"!{count}I")
+
+
+def parse_reply(data, nonce):
+    body = len(data) - HEADER.size
+    if body % 4:
+        return None
+    count = body // 4
+    if count not in (*WORD_SIZES, 346, 348, 352, 358, 360, 364, 368):
+        return None
+    magic, version, state, echo = HEADER.unpack_from(data)
+    if (magic, version, echo) != (b"B51R", 1, nonce) or state not in (0, 1, 2):
+        return None
+    words = words_struct(count).unpack_from(data, HEADER.size)
+    if state == 2 and (words[7] != 0xff or words[25] not in (1, 2, *NETWORK_VERSIONS)):
+        raise ValueError("Inconsistent terminal report")
+    result = describe(words) if words[25] in (1, 2, *NETWORK_VERSIONS) else dict(words=[f"{w:08x}" for w in words])
+    return dict(state=("waiting", "live", "terminal")[state], provider_phase=words[7], **result)
+
+
+def fetch(host, timeout, live, scheduler=False, rss=False, lan_tx=False, queues=False, workers=False):
+    deadline = time.monotonic() + timeout
+    last = None
+    step = 0
+    schema = 352 if workers else 368 if queues else 348 if lan_tx else 346 if rss else 336 if scheduler else WORD_SIZES[0]
+    required = 14 if workers else 11 if queues else 10 if lan_tx else 9 if rss else 8 if scheduler else None
+    failures = 0
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 1)
+        sock.connect((str(host), PORT))
+        while time.monotonic() < deadline:
+            nonce = secrets.token_bytes(8)
+            sock.settimeout(max(0.001, min(1.0, deadline - time.monotonic())))
+            try:
+                sock.send(HEADER.pack(b"B51Q", 1, 0, nonce) + bytes(words_struct(schema).size))
+                value = parse_reply(sock.recv(4096), nonce)
+            except TimeoutError:
+                value = None
+            except OSError as error:
+                if error.errno not in (errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH):
+                    raise
+                value = None
+            if value:
+                failures = 0
+                if live or value["state"] == "terminal" or value.get("version") in NETWORK_VERSIONS:
+                    if required is None or value.get("version") == required or (queues and value.get("version") in (12, 13, 15)):
+                        return value
+                phase = (value["state"], value["provider_phase"])
+                if phase != last:
+                    print(f"WAN reachable, provider {phase[0]}, phase {phase[1]}", file=sys.stderr)
+                    last = phase
+            else:
+                failures += 1
+                # A schema mismatch never draws a reply; step down one size.
+                if queues and schema >= 360:
+                    schema -= 4 if schema in (364, 368) else 2
+                if required is None and failures >= 3 and step + 1 < len(WORD_SIZES):
+                    step += 1
+                    schema = WORD_SIZES[step]
+                    failures = 0
+            time.sleep(max(0, min(0.3, deadline - time.monotonic())))
+    raise TimeoutError(f"No terminal B51 report from {host}" if last else f"No valid B51 reply from {host}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("router_ip", type=IPv4Address, help="WAN lease or LAN gateway with LAN status enabled")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--scheduler", action="store_true", help="request per-core PMU measurements from a benchmark image")
+    mode.add_argument("--rss", action="store_true", help="request RTL8125 per-queue counters from an RSS image")
+    mode.add_argument("--queues", action="store_true", help="request GMAC and RTL8125 descriptor counts by queue")
+    mode.add_argument("--workers", action="store_true", help="request directional worker and rejection counters")
+    mode.add_argument("--lan-tx", action="store_true", help="request direct LAN TX backlog per worker")
+    parser.add_argument("--live", action="store_true", help="return the first available checkpoint, including waiting or terminal")
+    parser.add_argument("--timeout", type=float, default=150, help="overall deadline in seconds")
+    args = parser.parse_args()
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("timeout must be finite and positive")
+    try:
+        print(json.dumps(fetch(args.router_ip, args.timeout, args.live, args.scheduler, args.rss, args.lan_tx, args.queues, args.workers), indent=2))
+    except (OSError, ValueError) as error:
+        parser.exit(1, f"{error}\n")

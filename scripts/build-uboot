@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+from policy import sha256
+
+root = Path(__file__).resolve().parents[1]
+p = argparse.ArgumentParser()
+p.add_argument('--diagnostic', action='store_true')
+args = p.parse_args()
+source = root / 'vendor/u-boot'
+output = root / ('out/diag-uboot' if args.diagnostic else 'out')
+build = output / 'build' if args.diagnostic else root / 'out/uboot'
+output.mkdir(parents=True, exist_ok=True)
+payload = root / 'out/loader.img'
+if not args.diagnostic and (not payload.is_file() or not 0 < payload.stat().st_size <= 0x4000000):
+    raise SystemExit('Missing or oversized genuine loader.img; build SDK and PD first')
+config = source / 'configs/nanopi-r5s-codex_defconfig'
+config.write_text((source / 'configs/nanopi-r5s-rk3568_defconfig').read_text() +
+                  '\n' + (root / 'firmware/uboot-config').read_text())
+dts = source / 'arch/arm/dts/rk3568-nanopi-r5s-u-boot.dtsi'
+original = subprocess.check_output(['git', '-C', str(source), 'show',
+                                    'HEAD:arch/arm/dts/rk3568-nanopi-r5s-u-boot.dtsi'])
+dts.write_bytes(original + b'\n' + (root / 'firmware/sd-only.dtsi').read_bytes())
+shutil.copy2(root / 'firmware/r5sboot.c', source / 'cmd/r5sboot.c')
+if not args.diagnostic:
+    digest = ', '.join('0x' + sha256(payload)[n:n + 2] for n in range(0, 64, 2))
+    (source / 'cmd/r5s_payload.h').write_text(
+        f'#define R5S_PAYLOAD_SHA256 {{{digest}}}\n#define R5S_PAYLOAD_SIZE {payload.stat().st_size}\n')
+makefile = source / 'cmd/Makefile'
+original = subprocess.check_output(['git', '-C', str(source), 'show', 'HEAD:cmd/Makefile'])
+makefile.write_bytes(original + b'\nobj-y += r5sboot.o\n')
+if args.diagnostic:
+    with makefile.open('ab') as stream:
+        stream.write(b'CFLAGS_r5sboot.o += -DR5S_UBOOT_DIAGNOSTIC\n')
+env = dict(os.environ, CROSS_COMPILE='aarch64-none-elf-',
+           BL31=str(root / 'vendor/rkbin/bin/rk35/rk3568_bl31_v1.46.elf'),
+           ROCKCHIP_TPL=str(root / 'vendor/rkbin/bin/rk35/rk3568_ddr_1560MHz_v1.26.bin'),
+           SOURCE_DATE_EPOCH='1767225600', KBUILD_BUILD_USER='r5s', KBUILD_BUILD_HOST='builder')
+for name in ('BL31', 'ROCKCHIP_TPL'):
+    if not Path(env[name]).is_file():
+        raise SystemExit(f'Missing pinned firmware: {env[name]}')
+cmd = ['make', '-C', str(source), f'O={build}']
+subprocess.run(cmd + ['nanopi-r5s-codex_defconfig'], env=env, check=True)
+effective = (build / '.config').read_text().splitlines()
+for forbidden in ('ENV_IS_IN_MMC', 'ENV_IS_IN_SPI_FLASH', 'BOOTCOUNT_LIMIT', 'NET', 'PCI',
+                  'USB', 'USB_GADGET', 'MMC_WRITE', 'MMC_SDHCI', 'FAT_WRITE', 'WDT',
+                  'WATCHDOG', 'BOOTSTD', 'CMD_SAVEENV', 'CMD_ROCKUSB'):
+    if f'CONFIG_{forbidden}=y' in effective:
+        raise SystemExit(f'Unsafe effective configuration: CONFIG_{forbidden}')
+for required in ('CONFIG_ENV_IS_NOWHERE=y', 'CONFIG_BOOTCOMMAND="r5sboot"'):
+    if required not in effective:
+        raise SystemExit(f'Missing effective configuration: {required}')
+subprocess.run(cmd + [f'-j{min(os.cpu_count() or 1, 8)}'], env=env, check=True)
+shutil.copy2(build / 'u-boot-rockchip.bin', output / 'u-boot-rockchip.bin')
+shutil.copy2(build / '.config', output / 'uboot.config')
+if args.diagnostic:
+    shutil.copy2(build / 'u-boot', output / 'u-boot.elf')
+    shutil.copy2(build / 'u-boot.map', output / 'u-boot.map')

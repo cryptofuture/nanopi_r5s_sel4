@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+import argparse
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parents[1]
+p = argparse.ArgumentParser()
+p.add_argument('--output', type=Path, default=Path('out/r5s-microkit.img'))
+args = p.parse_args()
+os.chdir(root)
+if args.output.exists():
+    sys.exit('Output already exists; select a new --output regular image path')
+(root / 'out/logs').mkdir(parents=True, exist_ok=True)
+steps = [('sources', []), ('build-sdk', []), ('build-pd', []),
+         ('build-pd', ['--fault-injection']), ('build-uboot', []),
+         ('check-layout', []), ('make-image', [str(args.output)])]
+for index, (name, step_args) in enumerate(steps):
+    log = root / f'out/logs/{index:02d}-{name}.log'
+    print(f'{name}: {log}', flush=True)
+    with log.open('w') as output:
+        result = subprocess.run([sys.executable, str(root / 'scripts' / name), *step_args],
+                                stdout=output, stderr=subprocess.STDOUT)
+    if result.returncode:
+        sys.exit(f'FAILED: {name}; inspect {log}; no hardware action performed')
+print(f'Built and statically validated {args.output}. Hardware not tested.')

@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import json,tarfile,hashlib,tempfile,shutil
+from image import verify
+from policy import sha256
+root=Path(__file__).resolve().parents[1]
+base=root/'out/network-freshness'
+codes={0:'Unavailable or unclassified',1:'Counter frequency',2:'Supervisor poll deadline',3:'Health PD deadline',4:'Driver state or ABI',5:'PHY sample freshness',6:'Driver execution freshness',7:'Application fault, invalid status or expired publication',8:'Invalid timestamp',9:'Startup phase deadline'}
+for i,label in enumerate(['clock','MAC revision','inactive MAC/DMA check','MDIO operation','PHY identity/status','PHY reset deadline','negotiated rate/duplex','platform readback','IO-domain guard','counter frequency'],1):codes[16+i]='Driver link/init: '+label
+for i,label in enumerate(['cache maintenance','pool or start-state guard','MAC hardware feature fields','quiesce deadline','channel fault status','TX deadline','descriptor ownership/completion','TX packet length']):codes[32+i]='DMA: '+label
+codes.update({40:'Queue contract',41:'Register write guard',59:'Cache geometry',60:'CPU scratch readback',61:'Driver saw supervisor failure',62:'Driver initialization deadline'})
+for i in range(11):codes[48+i]=f'Preflight cache syscall result {i+1}'
+def word(i):
+    bits=f'{i:07b}'+str(i.bit_count()%2)
+    return ' / '.join(s.translate(str.maketrans('01','SL')) for s in [bits[:4],bits[4:]])
+(base/'fault-codes.md').write_text('# Network freshness diagnostic\n\nUse only this build’s table. After flutter, read two groups of four symbols. Short is 0.4 s ON and long is 2 s ON. Read the same word twice. A supervisory deadline identifies missing progress. A stopped supervisor or kernel may prevent reporting.\n\n| Word | Report |\n|---|---|\n'+''.join(f'| {word(i)} | {v} |\n' for i,v in sorted(codes.items())))
+assert (base/'wan/work/wan-app/src/main.rs').read_bytes()==(root/'pds/wan_dhcp_freshness/src/main.rs').read_bytes(), 'WAN must contain consistent-link fix'
+hashes={}
+for folder,profile in [('rawio','gmac-rawio'),('wan','wan-dhcp')]:
+    image=base/folder/f'r5s-{profile}.img'
+    m=verify(image)
+    assert sha256(image)==sha256(image.with_name(image.stem+'.reproduced.img'))
+    hashes[image.name]=sha256(image)
+    if folder=='rawio':build=m['build_id']
+s=(root/'out/network-corrected/operator.md').read_text().replace('network-corrected','network-freshness').replace('e88f94e2e74ca500af750f2c7ff5ddb7',build)
+a=s.index('FAULT remains flutter/darkness.');z=s.index('\n',a)
+s=s[:a]+'FAULT now emits a latched word after flutter. Use fault-codes.md and observe the same complete word twice.'+s[z:]
+(base/'operator.md').write_text(s)
+(base/'SHA256SUMS').write_text(''.join(f'{h}  {folder}/{name}\n' for (name,h),folder in zip(hashes.items(),['rawio','wan'])))
+with tempfile.TemporaryDirectory(dir=base) as tmp:
+    stage=Path(tmp)/'network-freshness';stage.mkdir()
+    for name in ['operator.md','fault-codes.md','findings.md']:shutil.copyfile(base/name,stage/name)
+    for folder,profile in [('rawio','gmac-rawio'),('wan','wan-dhcp')]:
+        name=f'r5s-{profile}.img';shutil.copyfile(base/folder/name,stage/name)
+    for directory in ['tools/netprobe','protocol']:
+        shutil.copytree(root/directory,stage/directory,ignore=shutil.ignore_patterns('__pycache__'))
+    shutil.copyfile(root/'tools/net-peer',stage/'tools/net-peer')
+    (stage/'scripts').mkdir()
+    for f in (root/'scripts').iterdir():
+        if f.suffix=='.py' or f.name in ['flash-sd','verify-image']:shutil.copyfile(f,stage/'scripts'/f.name)
+    shutil.copyfile(root/'scripts/check-router-deps',stage/'scripts/check-deps')
+    files=sorted(p for p in stage.rglob('*') if p.is_file())
+    (stage/'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.relative_to(stage)}\n' for p in files))
+    archive=base/'r5s-network-freshness-handoff.tar.gz'
+    with tarfile.open(archive,'x:gz') as tar:tar.add(stage,arcname=stage.name)
+    archive.with_name(archive.name+'.sha256').write_text(f'{sha256(archive)}  {archive.name}\n')
+print(hashes)

@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+import hashlib,json,re,shutil,subprocess,sys,tarfile,difflib
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1];BASE=ROOT/'out/preflight-repair-v2';NEW=BASE/'gmac-dma-preflight-repair-v2';OLD=ROOT/'out/gmac-rawio/gmac-dma-preflight'
+sys.path.insert(0,str(ROOT/'scripts'))
+from policy import sha256
+from fdt_evidence import Fdt
+
+def main():
+ a=json.loads((BASE/'ARTIFACTS.json').read_text())
+ for p,h in a['preserved'].items():assert sha256(ROOT/p)==h,p
+ for p,h in json.loads((BASE/'source-hashes.json').read_text()).items():assert sha256(ROOT/p)==h,p
+ firmware={}
+ for name in ('idbloader.img','spl/u-boot-spl.bin','u-boot.dtb','u-boot-nodtb.bin','u-boot.itb'):
+  p=OLD/'build'/name;q=NEW/'build'/name;firmware[name]=dict(old=sha256(p),new=sha256(q),identical=sha256(p)==sha256(q))
+ assert all(firmware[name]['identical'] for name in ('idbloader.img','spl/u-boot-spl.bin','u-boot.dtb'))
+ assert sha256(OLD/'uboot.config')==sha256(NEW/'uboot.config')
+ compared={name:dict(old=sha256(OLD/name),new=sha256(NEW/name),identical=sha256(OLD/name)==sha256(NEW/name)) for name in ('driver.elf','heartbeat.elf','health.elf','loader.elf','sel4.elf','initialiser.elf','monitor.elf','loader.img','uboot.config')}
+ (BASE/'differential.json').write_text(json.dumps(dict(components=compared,firmware=firmware,working_link_supervisor_equals_failed=sha256(ROOT/'out/gmac-bringup/supervisor.elf')==sha256(OLD/'heartbeat.elf')),indent=2)+'\n')
+ logs=BASE/'logs/linked';logs.mkdir(exist_ok=True)
+ for elf in NEW.glob('*.elf'):
+  with (logs/(elf.name+'.layout.txt')).open('w') as out:subprocess.run(['readelf','-lSW',elf],stdout=out,check=True)
+ for name in ('driver','heartbeat'):
+  with (logs/(name+'.disassembly.txt')).open('w') as out:subprocess.run(['aarch64-none-elf-objdump','-d',NEW/(name+'.elf')],stdout=out,check=True)
+ with (logs/'fit-inventory.txt').open('w') as out:subprocess.run([NEW/'build/tools/dumpimage','-l',NEW/'build/u-boot.itb'],stdout=out,check=True)
+ stats=[]
+ for p in (BASE/'work/fixed-driver/target').rglob('*.su'):stats+=p.read_text().splitlines()
+ (logs/'c-stack-usage.txt').write_text('\n'.join(stats)+'\n')
+ fdt_path=ROOT/'evidence/gmac-captured-1e089e3a/inner/gmac-evidence/runtime-original.dtb';fdt=Fdt(fdt_path.read_bytes())
+ reserved=list(fdt.reservations)
+ for path in fdt.nodes:
+  if path.startswith('/reserved-memory/') and 'reg' in fdt.nodes[path]:reserved.extend((start,start+size) for start,size in fdt.regs(path))
+ for start,end in reserved:assert end<=0x20000000 or start>=0x40000000
+ layout=json.loads((BASE/'layout-report.json').read_text());layout['captured_reservations']=dict(source=str(fdt_path.relative_to(ROOT)),sha256=sha256(fdt_path),original_fdt_reservation_table=fdt.reservations,all_reserved_ranges=reserved,working_ram=[0x20000000,0x40000000],overlap=False)
+ (BASE/'layout-report.json').write_text(json.dumps(layout,indent=2)+'\n')
+ (BASE/'dma-map.json').write_text(json.dumps(dict(dma_enabled=False,bus_address=None,role='CPU-owned scratch, never descriptors or packet buffers',cpu_virtual=0x60000000,physical=0x24000000,size=0x40000,alignment=4096,cache_line=64,attributes='Normal-WB',owner='gmac',frames=64,device_aliases=False,kernel_alias='Normal-WB',device_visibility_proven=False),indent=2)+'\n')
+ (BASE/'capability-audit.json').write_text(json.dumps(dict(abi=2,words=40,pool_owner='gmac',vspace_slot=3,vspace_object='pud_gmac',tcb_vspace_object='pud_gmac',service_type='native VSpace root',asid='validated by pinned kernel invocation, live numeric ASID not captured',ipc_virtual=0xfffffff000,stack_virtual=[0xffffffc000,0xffffffe000],ipc_owner='actual Rust TLS IPC buffer initialized by sel4-microkit entrypoint',mmio='Device nGnRnE',ram='Normal-WB',sys_owner_after_monitor_release='heartbeat',pd_changes='no added PDs, priorities/budgets/stacks unchanged',smmu_enabled=False),indent=2)+'\n')
+ fields=['sequence','abi','profile','generation','phase','phase_started_ms','execution_ms','completed_pages','phy_sample_ms','link_state','speed_mbps','full_duplex','cache_passed','inactive_checked','first_reason','first_result','operation','arg_start_low','arg_end_low','first_phase','first_time_ms','first_progress','first_link','build_id_0','build_id_1','build_id_2','build_id_3','arg_start_high','arg_end_high','component','observed','expected','first_phase_started_ms','live_mac_version','live_phy_id','live_clock_hz','first_mac_version','first_phy_id','first_clock_hz','reserved']
+ (BASE/'status-abi.json').write_text(json.dumps(dict(version=2,atomic_width=32,bytes=160,driver_virtual=0x40002000,fields={str(i):name for i,name in enumerate(fields)},commit='odd/even sequence with release/acquire, reader bounded to two attempts',result='seL4 error only for CACHE_CALL; signed C return encoded u32 for LINK_INIT/LINK_POLL/INACTIVE; supervisor code for cooperative abort',supervisor_record_virtual=0x40001080,supervisor_record='reason committed last; independent first-effect record; profile/build/component/phase/progress/last execution/link/result retained',persistent=False),indent=2)+'\n')
+ first=ROOT/'out/preflight-fix/gmac-dma-preflight-fixed'
+ good=ROOT/'out/gmac-bringup/gmac-link'
+ comparison={}
+ for name in ('driver.elf','heartbeat.elf','health.elf','loader.elf','sel4.elf','initialiser.elf','monitor.elf','loader.img','system.system','microkit-report.txt','r5s_payload.h','uboot.config'):
+  locations={'link':good/name,'original':OLD/name,'first_repair':first/name,'second_repair':NEW/name}
+  if name=='driver.elf':locations['link']=ROOT/'out/gmac-bringup/driver.elf'
+  if name=='heartbeat.elf':locations['link']=ROOT/'out/gmac-bringup/supervisor.elf'
+  if name in ('system.system','health.elf'):locations['link']=ROOT/'out/gmac-bringup'/name
+  comparison[name]={k:dict(path=str(p.relative_to(ROOT)),sha256=sha256(p)) if p.exists() else None for k,p in locations.items()}
+ shipped={}
+ with tarfile.open(ROOT/'out/preflight-fix/r5s-preflight-fix-handoff.tar.gz') as tar:
+  for name in ('contract.rs','supervisor.rs','driver.rs','exercise.rs','poll.c','display.rs'):
+   member='preflight-fix/sources/pds/preflight_fixed/src/'+name
+   data=tar.extractfile(member).read();assert data==(ROOT/'pds/preflight_fixed/src'/name).read_bytes()
+   shipped[member]=hashlib.sha256(data).hexdigest()
+  for name in ('driver.elf','heartbeat.elf','loader.img','r5s_payload.h','system.system','microkit-report.txt'):
+   data=tar.extractfile('preflight-fix/build-evidence/'+name).read();assert data==(first/name).read_bytes()
+   shipped['build-evidence/'+name]=hashlib.sha256(data).hexdigest()
+ from image import verify
+ first_manifest=verify(ROOT/'out/preflight-fix/r5s-gmac-dma-preflight-fixed.img')
+ assert first_manifest==json.loads((ROOT/'out/preflight-fix/r5s-gmac-dma-preflight-fixed.manifest.json').read_text())
+ for label,directory in [('first',ROOT/'out/preflight-fix'),('second',BASE)]:
+  fingerprints=[p for p in (directory/'work/fixed-driver/target').rglob('run-build-script-build-script-build.json') if 'link-config.h' in p.read_text()]
+  assert len(fingerprints)==1
+  shutil.copyfile(fingerprints[0],BASE/f'logs/{label}-cargo-c-dependencies.json')
+ comparison['first_shipped_sources_and_binaries']=shipped
+ comparison['first_image_sha256']=sha256(ROOT/'out/preflight-fix/r5s-gmac-dma-preflight-fixed.img')
+ comparison['decoder_unchanged_from_first_repair']=sha256(BASE/'compiled-link.c')==sha256(ROOT/'out/preflight-fix/compiled-link.c')
+ assert comparison['decoder_unchanged_from_first_repair']
+ comparison['system_unchanged_from_first_repair']=sha256(NEW/'system.system')==sha256(first/'system.system')
+ assert comparison['system_unchanged_from_first_repair']
+ (BASE/'comparison-to-first-repair.json').write_text(json.dumps(comparison,indent=2)+'\n')
+ diff=[]
+ for name in ('build.rs','src/contract.rs','src/supervisor.rs'):
+  old=ROOT/'pds/preflight_fixed'/name;new=ROOT/'pds/preflight_repair_v2'/name
+  diff.extend(difflib.unified_diff(old.read_text().splitlines(True),new.read_text().splitlines(True),fromfile=str(old.relative_to(ROOT)),tofile=str(new.relative_to(ROOT))))
+ (BASE/'repair.patch').write_text(''.join(diff))
+ leds={}
+ for path,props in fdt.nodes.items():
+  if path.startswith('/gpio-leds/') or path.startswith('/pinctrl/gpio-leds/'):
+   leds[path]={k:v.hex() for k,v in props.items()}
+ (BASE/'auxiliary-led-evidence.json').write_text(json.dumps(dict(source=str(fdt_path.relative_to(ROOT)),nodes=leds,included=False,reason='Captured GPIO/pinctrl declarations establish candidate functions, not physical case visibility. No new GPIO2/GPIO3 or shared GRF/CRU authority added in this timing-only candidate.'),indent=2)+'\n')
+ print('Firmware/runtime differential, frame/reservation audit and actual linked disassembly saved')
+if __name__=='__main__':main()

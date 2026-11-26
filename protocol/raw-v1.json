@@ -1,0 +1,1 @@
+{"version":1,"ethertype":34997,"magic":"R5SN","board_mac":"02:52:35:53:00:01","max_data":1400,"header_bytes":68,"nonce_bytes":16,"build_id_bytes":16,"ack_timeout_ms":2000,"lease_ms":5000,"rate_hz":1,"bench_only":true}

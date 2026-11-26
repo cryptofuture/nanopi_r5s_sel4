@@ -1,0 +1,15 @@
+{
+  "commit": "830b3c68c1fb1e9176028d02ef86f3cf76aa2476",
+  "tag": "v6.1",
+  "runtime_dependency": false,
+  "files": {
+    "drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.h": {
+      "url": "https://raw.githubusercontent.com/torvalds/linux/830b3c68c1fb1e9176028d02ef86f3cf76aa2476/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.h",
+      "sha256": "51cf590173358ee6e0e89e6958086236fe8f639b26e8d216ffcd18e3f221dd27"
+    },
+    "LICENSES/preferred/GPL-2.0": {
+      "url": "https://raw.githubusercontent.com/torvalds/linux/830b3c68c1fb1e9176028d02ef86f3cf76aa2476/LICENSES/preferred/GPL-2.0",
+      "sha256": "f6b78c087c3ebdf0f3c13415070dd480a3f35d8fc76f3d02180a407c1c812f79"
+    }
+  }
+}

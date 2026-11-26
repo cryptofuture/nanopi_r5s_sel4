@@ -1,0 +1,37 @@
+#!/bin/bash
+set -eu
+cd "$(dirname "$0")/.."
+. scripts/env
+mkdir -p out/router-integrated/logs
+output=$(mktemp -d "$PWD/out/router-integrated/logs/host-tests.XXXXXXXX")
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cargo test --offline --manifest-path router-core/Cargo.toml > "$output/core-tests.log" 2>&1
+cargo test --offline --release --manifest-path router-core/Cargo.toml --features integrated-lan -- --nocapture > "$output/ethernet-tests.log" 2>&1
+rustc --edition 2021 --test drivers/rtl8125/lib.rs -o "$work/pcie"
+"$work/pcie" > "$output/pcie-tests.log"
+rustc --edition 2021 --test pds/gmac_dma_corrected/src/zc.rs -o "$work/zc"
+"$work/zc" > "$output/zc-tests.log"
+rustc --edition 2021 --test tests/tso_testgen_test.rs -o "$work/tso"
+"$work/tso" > "$output/tso-tests.log"
+rustc --edition 2021 --test tests/tso_lan_test.rs -o "$work/tso-lan"
+"$work/tso-lan" > "$output/tso-lan-tests.log"
+rustc --edition 2021 --test tests/gmac_queue_test.rs -o "$work/gmac-queue"
+"$work/gmac-queue" > "$output/gmac-queue-tests.log"
+rustc --edition 2021 --test pds/gmac_dma_corrected/src/rk3568_clock.rs -o "$work/clocks"
+"$work/clocks" > "$output/clock-tests.log"
+rustc --edition 2021 --test tests/network_health_test.rs -o "$work/health"
+"$work/health" > "$output/health-tests.log"
+cc -fsanitize=address,undefined -Wall -Wextra -Werror -Idrivers/gmac0/dma \
+  tests/gmac_dma_test.c drivers/gmac0/dma/dma.c -o "$work/dma"
+"$work/dma" > "$output/dma-tests.log" 2>&1
+cc -fsanitize=address,undefined -Wall -Wextra -Werror -DR5S_GMAC_PBL=32 -DR5S_GMAC_PBLX8 -DR5S_GMAC_RK3568_AXI -DR5S_GMAC_HYBRID_IRQ -DR5S_ZC_WRITEBACK -DR5S_WAN_RX_CHECKSUM -DR5S_WAN_TX_IPV4_CHECKSUM -DR5S_GMAC_EAME -Idrivers/gmac0/dma \
+  tests/gmac_dma_test.c drivers/gmac0/dma/dma.c -o "$work/dma-pblx8"
+"$work/dma-pblx8" > "$output/dma-pblx8-tests.log" 2>&1
+cc -fsanitize=address,undefined -Wall -Wextra -Werror -DR5S_GMAC_TWO_TX -DR5S_GMAC_TWO_RX -Idrivers/gmac0/dma \
+  tests/gmac_dma_test.c drivers/gmac0/dma/dma.c -o "$work/dma-two-tx"
+"$work/dma-two-tx" > "$output/dma-two-tx-tests.log" 2>&1
+cc -fsanitize=address,undefined -Wall -Wextra -Werror -DR5S_WAN_TSO -Idrivers/gmac0/dma \
+  tests/gmac_tso_test.c drivers/gmac0/dma/dma.c -o "$work/dma-tso"
+"$work/dma-tso" > "$output/dma-tso-tests.log" 2>&1
+printf 'PASS: host router, PCIe, zero-copy pool, TSO, network health and sanitized GMAC DMA tests\nLogs: %s\n' "$output"

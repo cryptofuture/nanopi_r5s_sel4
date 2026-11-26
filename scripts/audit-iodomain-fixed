@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+import sys,struct,json,re,subprocess,hashlib
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'scripts'))
+from policy import sha256
+from image import verify
+from elftools.elf.elffile import ELFFile
+B=ROOT/'out/preflight-iodomain-fix';P=B/'iodomain-fixed'
+def main():
+ data=(P/'loader.img').read_bytes();h=json.loads((P/'handoff.json').read_text());off=h['payload_offset'];assert data[off:off+256]==struct.pack('<I',0x494f5231)*64
+ matches=[]
+ for m in re.finditer(re.escape(struct.pack('<Q',0x5e14dead14de5ead)),data):
+  p=m.start();head=struct.unpack_from('<8Q',data,p)
+  if head[1]==len(data)-p and 0<head[7]<100:matches.append((p,head))
+ assert len(matches)==1;p,head=matches[0];dest=[]
+ for i in range(head[7]):
+  address,size,source,kind=struct.unpack_from('<4Q',data,p+64+i*32);start=p+64+head[7]*32+source
+  if start<=off and off+256<=start+size:dest.append(address+off-start)
+ assert len(dest)==1
+ with (P/'heartbeat.elf').open('rb') as f:
+  elf=ELFFile(f);symbols=elf.get_section_by_name('.symtab').get_symbol_by_name('IO_HANDOFF');assert len(symbols)==1
+  symbol=symbols[0];va=symbol['st_value'];assert symbol['st_size']==256
+  section=elf.get_section(symbol['st_shndx']);assert section['sh_type']=='SHT_PROGBITS' and section['sh_flags']&1
+  assert section.data()[va-section['sh_addr']:va-section['sh_addr']+256]==data[off:off+256]
+ h.update(loader_destination=dest[0],supervisor_virtual=va,section=section.name,retention='initialized PD image, not a newly retyped scratch frame',checksum='rotate-left-one XOR first 63 words',visibility='existing U-Boot flush_dcache_all then cache/MMU teardown; existing loader memcpy and kernel entry maintenance')
+ (B/'handoff-layout.json').write_text(json.dumps(h,indent=2)+'\n')
+ manifest=verify(B/'r5s-preflight-iodomain.img');assert manifest['observation_spec_sha256']==sha256(B/'observation-spec.json')
+ assert sha256(B/'r5s-preflight-iodomain.img')==sha256(B/'r5s-preflight-iodomain.reproduced.img')
+ for path,digest in json.loads((B/'preserved.json').read_text()).items():assert sha256(ROOT/path)==digest,path
+ for name in ('driver','heartbeat'):
+  with (B/'logs'/f'{name}-disassembly.txt').open('w') as f:subprocess.run(['aarch64-none-elf-objdump','-d',P/(name+'.elf')],stdout=f,check=True)
+ with (B/'logs/uboot-symbols.txt').open('w') as f:subprocess.run(['aarch64-none-elf-nm','-S',P/'u-boot.elf'],stdout=f,check=True)
+ print(json.dumps(dict(image=sha256(B/'r5s-preflight-iodomain.img'),handoff=h,hardware_tested=False),indent=2))
+if __name__=='__main__':main()

@@ -1,0 +1,16 @@
+/ {
+    chosen {
+        u-boot,spl-boot-order = <&sdmmc0>;
+    };
+};
+&sdmmc0 {
+    fifo-mode;
+    u-boot,spl-fifo-mode;
+};
+&sdhci { status = "disabled"; };
+&sfc { status = "disabled"; };
+&gmac0 { status = "disabled"; };
+&gmac1 { status = "disabled"; };
+&pcie2x1 { status = "disabled"; };
+&pcie3x1 { status = "disabled"; };
+&pcie3x2 { status = "disabled"; };

@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import re
+from pathlib import Path
+import shutil
+import subprocess
+import tarfile
+import tempfile
+
+from handoff_trace import ROOT, BASELINES, require, symbols
+from image import verify
+from policy import sha256, elf_segments, check_ram
+from trace_profile import STAGES, ERRORS
+from diag import command_evidence
+
+p = argparse.ArgumentParser()
+p.add_argument('--directory', type=Path, default=ROOT / 'out/handoff-trace')
+base = p.parse_args().directory.resolve()
+images = sorted(p for p in base.glob('r5s-*.img') if '.reproduced.' not in p.name)
+require(bool(images), 'No trace images to package')
+for path, digest in BASELINES.items():
+    require(sha256(ROOT / path) == digest, f'Preserved baseline changed: {path}')
+source = {
+    1: 'firmware/r5sboot-trace.c:do_r5sboot, after five proven setup writes',
+    2: 'firmware/r5sboot-trace.c:do_r5sboot, after sha256_csum_wd/memcmp',
+    3: 'firmware/r5sboot-trace.c:do_r5sboot, before SD quiescence/DAIF/cache teardown',
+    4: 'microkit/loader/src/loader.c:main, after _start stack/relocate, before uart_init',
+    5: 'microkit/loader/src/loader.c:start_kernel, after arch_mmu_enable',
+    6: 'seL4/src/arch/arm/kernel/boot.c:try_init_kernel, after init_cpu, before init_plat',
+    7: 'microkit/monitor/src/main.c:main, before thread naming and monitor receive loop',
+    8: 'generated heartbeat/src/main.rs:init, after owner acquire and GPIO setup',
+}
+stage_map = json.loads((base / 'stage-map.json').read_text())
+stage_map['stages'] = {n: dict(component=component, meaning=meaning, source=source[n])
+                       for n, (component, meaning) in STAGES.items()}
+(base / 'stage-map.json').write_text(json.dumps(stage_map, indent=2) + '\n')
+layouts = json.loads((base / 'layout-report.json').read_text())
+sdk_elf = base / 'work/microkit/release/microkit-sdk-2.4.0/board/nanopi_r5s_trace/debug/elf'
+kernel_segments = elf_segments(sdk_elf / 'sel4.elf')[1]
+kernel_ram = {}
+for name, symbol in symbols(sdk_elf / 'sel4.elf').items():
+    if not symbol['size'] or not (name.startswith('armKSGlobalKernel') or name == 'kernel_stack_alloc'):
+        continue
+    for segment in kernel_segments:
+        if segment['virtual'] <= symbol['address'] and symbol['address'] + symbol['size'] <= segment['virtual'] + segment['size']:
+            start = segment['physical'] + symbol['address'] - segment['virtual']
+            check_ram((start, start + symbol['size']))
+            kernel_ram[name] = [start, start + symbol['size']]
+            break
+for profile, report in layouts.items():
+    report['pd_virtual_elf'] = dict(entry=elf_segments(base / 'heartbeat.elf')[0],
+                                    segments=elf_segments(base / 'heartbeat.elf')[1],
+                                    physical_allocation='See frame_elf_heartbeat and stack objects in capdl_objects')
+    report['kernel_stack_and_page_tables_physical'] = kernel_ram
+    report['copy_buffer'] = 'No separate buffer: memcpy directly from disjoint loader input to listed destinations'
+    report['initialiser_stack_heap'] = 'Static root-task stack/heap in initialiser ELF; physical placement is in loader copy intervals'
+(base / 'layout-report.json').write_text(json.dumps(layouts, indent=2) + '\n')
+manifests = base / 'manifests'
+manifests.mkdir(exist_ok=True)
+audit = {}
+for image in images:
+    manifest = verify(image)
+    profile = manifest['profile']
+    output = base / profile
+    build = output / 'build'
+    require(sha256(image) == sha256(image.with_name(image.stem + '.reproduced.img')), 'Image reproduction differs')
+    require(sha256(output / 'loader.img') == manifest['loader']['sha256'], 'Payload differs from image')
+    shutil.copyfile(image.with_suffix('.manifest.json'), manifests / f'{profile}.json')
+    shutil.copyfile(build / 'u-boot.map', output / 'u-boot.map')
+    record = dict(command=command_evidence(build / 'u-boot'), fit={})
+    names = subprocess.check_output(['fdtget', '-l', str(build / 'u-boot.itb'), '/images'], text=True).splitlines()
+    with tempfile.TemporaryDirectory() as temp:
+        for index, name in enumerate(names):
+            hashes = []
+            for label, directory in (('traced', build), ('proven', ROOT / 'out/diag-uboot/build')):
+                extracted = Path(temp) / label
+                subprocess.run([str(build / 'tools/dumpimage'), '-T', 'flat_dt', '-p', str(index),
+                                '-o', str(extracted), str(directory / 'u-boot.itb')], check=True,
+                               stdout=subprocess.DEVNULL)
+                digest = sha256(extracted)
+                advertised = subprocess.check_output(['fdtget', '-t', 'bx', str(directory / 'u-boot.itb'),
+                                                       f'/images/{name}/hash', 'value'], text=True)
+                require(bytes(int(x, 16) for x in advertised.split()).hex() == digest, f'FIT hash invalid: {name}')
+                if label == 'traced' and name == 'u-boot':
+                    require(digest == sha256(build / 'u-boot-nodtb.bin'), 'Stale U-Boot in FIT')
+                hashes.append(digest)
+            require((hashes[0] != hashes[1]) == (name == 'u-boot'), f'Unexpected early firmware change: {name}')
+            record['fit'][name] = dict(traced=hashes[0], proven=hashes[1], changed=hashes[0] != hashes[1])
+    for name in ('u-boot', 'loader'):
+        path = output / f'{name}.elf'
+        (output / f'{name}.symbols.map').write_text(subprocess.check_output(['aarch64-none-elf-nm', '-n', str(path)], text=True))
+        function = 'do_r5sboot' if name == 'u-boot' else 'main'
+        (base / f'logs/{profile}-{name}-entry.S').write_text(subprocess.check_output(
+            ['aarch64-none-elf-objdump', '-d', f'--disassemble={function}', str(path)], text=True))
+    audit[profile] = record
+(base / 'fit-command-audit.json').write_text(json.dumps(audit, indent=2) + '\n')
+elf = base / 'elf'
+elf.mkdir(exist_ok=True)
+sdk = base / 'work/microkit/release/microkit-sdk-2.4.0/board/nanopi_r5s_trace/debug/elf'
+for name in ('sel4', 'monitor', 'initialiser'):
+    shutil.copyfile(sdk / f'{name}.elf', elf / f'{name}.elf')
+    (elf / f'{name}.symbols.map').write_text(subprocess.check_output(['aarch64-none-elf-nm', '-n', str(elf / f'{name}.elf')], text=True))
+shutil.copyfile(base / 'heartbeat.elf', elf / 'heartbeat.elf')
+board = sdk.parent
+shutil.copyfile(board / 'include/kernel/gen_config.h', elf / 'kernel-gen_config.h')
+shutil.copyfile(board / 'platform_gen.json', elf / 'platform_gen.json')
+(elf / 'heartbeat.symbols.map').write_text(subprocess.check_output(['aarch64-none-elf-nm', '-n', str(elf / 'heartbeat.elf')], text=True))
+boot_manifest = json.loads((base / 'r5s-boot-trace.manifest.json').read_text())
+if boot_manifest['stop_checkpoint'] in (1, 2, 3):
+    require('r5s_enter' not in symbols(base / 'boot-trace/u-boot.elf'), 'Early stop still links a handoff')
+else:
+    require(re.search(r'\bbr\s+x0\b', subprocess.check_output(['aarch64-none-elf-objdump', '-d', '--disassemble=r5s_enter',
+                                                            str(base / 'boot-trace/u-boot.elf')], text=True)),
+            'Handoff does not branch through x0')
+files = list(images) + sorted(manifests.glob('*.json'))
+files += [base / name for name in ('stage-map.json', 'layout-report.json', 'fit-command-audit.json', 'system.system')]
+files += list(elf.iterdir()) + list((base / 'patches').iterdir())
+for image in images:
+    directory = base / verify(image)['profile']
+    files += [p for p in directory.iterdir() if p.is_file()]
+files += [p for p in (base / 'logs').iterdir() if p.is_file() and p.name not in
+          ('artifact-check.log', 'transfer-check.log', 'bundle-validation.log')]
+test_log = (base / 'logs/tests.log').read_text()
+test_count = re.search(r'Ran ([0-9]+) tests', test_log)
+require(test_count is not None and test_log.rstrip().endswith('OK'), 'Host tests are missing, skipped or failing')
+record = dict(built=True, statically_validated=True, hardware_tested=False, simulated=False,
+              host_tests_passed=int(test_count[1]),
+              proven_diagnostic_observation='User observed two long flashes approximately every four seconds',
+              recovery='Earlier card-removal Ubuntu recovery observed; post-diagnostic recovery and eMMC hash comparison not supplied',
+              baselines=BASELINES, files={str(p.relative_to(base)): sha256(p) for p in sorted(set(files))},
+              current_sources={str(p.relative_to(ROOT)): sha256(p) for p in
+                               (ROOT / 'scripts/flash-sd', ROOT / 'scripts/image.py', ROOT / 'scripts/trace_profile.py',
+                                ROOT / 'scripts/handoff_trace.py', ROOT / 'scripts/package-handoff-trace')})
+(base / 'ARTIFACTS.json').write_text(json.dumps(record, indent=2) + '\n')
+files += [base / 'ARTIFACTS.json']
+(base / 'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.relative_to(base)}\n' for p in sorted(set(files))))
+stage = base / 'transfer'
+stage.mkdir(exist_ok=True)
+(stage / 'scripts').mkdir(exist_ok=True)
+for name in ('flash-sd', 'verify-image', 'image.py', 'policy.py', 'diag_profile.py', 'trace_profile.py'):
+    shutil.copyfile(ROOT / 'scripts' / name, stage / 'scripts' / name)
+for file in files:
+    destination = stage / file.relative_to(base)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(file, destination)
+for name in ('r5s-handoff-trace.md', 'r5s-handoff-trace-results.md'):
+    shutil.copyfile(ROOT / 'docs' / name, stage / name)
+for name in ('sources.lock', 'requirements.lock'):
+    shutil.copyfile(ROOT / name, stage / name)
+stage_files = sorted(p for p in stage.rglob('*') if p.is_file() and p.name != 'SHA256SUMS')
+(stage / 'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.relative_to(stage)}\n' for p in stage_files))
+bundle = base / 'r5s-handoff-trace-bundle.tar.gz'
+with tarfile.open(bundle, 'w:gz') as archive:
+    archive.add(stage, arcname='handoff-trace' if base.name == 'handoff-trace' else f'handoff-trace-{base.name}')
+bundle.with_name(bundle.name + '.sha256').write_text(f'{sha256(bundle)}  {bundle.name}\n')
+print('Packaged current writer, audited payload images, ELFs, patches, reports and logs:', bundle)

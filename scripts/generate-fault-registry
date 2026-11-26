@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+import json,hashlib
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1];BASE=ROOT/'out/preflight-fault-id';SRC=ROOT/'pds/preflight_fault_id/src'
+entries=[];arms=[]
+def add(key,producer,operation,predicate,source,inference=False):
+ i=len(entries)+1
+ if i>127:raise ValueError('Fault registry exceeds seven bits')
+ bits=[(i>>n)&1 for n in range(6,-1,-1)];bits.append(sum(bits)%2);w=''.join('L' if x else 'S' for x in bits)
+ entries.append(dict(id=i,word=w[:4]+' / '+w[4:],producer=producer,operation=operation,predicate=predicate,source=source,inference=inference,key=key))
+ arms.append(f'        ({key[0]},{key[1]},{key[2]})=>{i},')
+errors=['InvalidArgument','InvalidCapability','IllegalOperation','RangeError','AlignmentError','FailedLookup','TruncatedMessage','DeleteFirst','RevokeFirst','NotEnoughMemory']
+for op,name in enumerate(['Clean','Invalidate','CleanInvalidate']):
+ for result,error in enumerate(errors,1):add([3,op,result],'driver',name,f'seL4 returned {result} ({error}); arguments retained','driver.rs:Native::call')
+ for reason,meaning in [(2,'private range/geometry rejected'),(4,'CPU readback mismatch')]:
+  if reason==4 and op==0:continue
+  add([reason,op,0],'driver',name,meaning,'exercise.rs:maintain/page')
+for result,meaning in {1:'clock derivation not 125MHz',2:'unsupported MAC revision',3:'MAC/DMA not inactive',4:'MDIO operation failed',5:'unexpected PHY ID',6:'PHY reset deadline',8:'platform readback failed',9:'IO domain selectors invalid'}.items():add([5,0,result],'driver','link_init',meaning,'link.c:link_init')
+for result,meaning in [(-3,'inactive guard'),(-4,'MDIO error'),(-5,'PHY ID/BMSR invalid'),(-7,'resolved unsupported speed/duplex')]:add([6,0,result&0xffffffff],'driver','link_poll',meaning,'poll.c:link_poll')
+for reason,name in [(1,'counter frequency'),(7,'inactive MAC/DMA guard'),(8,'register address/write whitelist'),(9,'cooperative supervisor stop'),(10,'absolute phase deadline')]:add([reason,99,99],'driver',name,'explicit terminal record; raw arguments retained','driver.rs',reason in (9,10))
+for code,name in {101:'ABI/profile/build/sequence invalid',102:'no first producer publication',103:'producer execution/sequence not progressing',104:'phase/preconditions invalid or deadline expired',105:'PHY sample missing/stale',106:'link metadata invalid',107:'producer epoch changed',108:'phase start changed',109:'counter frequency invalid',110:'health PD progress not observed',111:'supervisor scheduling gap >10ms'}.items():add([100,0,code],'supervisor','health',name,'contract.rs:Health::check / supervisor.rs:init',True)
+for pd,name in enumerate(['gmac','health','heartbeat']):
+ for label,meaning in [(1,'capability fault'),(2,'unknown syscall'),(3,'user exception'),(4,'debug exception'),(5,'scheduling timeout'),(6,'VM fault'),(7,'VGIC maintenance fault'),(8,'VCPU fault'),(9,'VPPI event')]:add([200,pd,label],'monitor',name,meaning+' received on designated fault endpoint','monitor-hook.h:publish_fault')
+add([201,0,0],'monitor','unknown exception','unknown PD/fault label; raw fields retained','monitor-hook.h:publish_fault')
+add([202,0,0],'reporter','incomplete exception record','monitor publication incomplete or invalid','report.rs:select',True)
+add([203,0,0],'reporter','provenance unavailable','terminal result has no complete known producer record','report.rs:select',True)
+spec=dict(version=1,id_zero='Unavailable or invalid provenance; never success',bit_order='seven ID bits MSB first, then even parity',timing_ms=dict(transition=500,frame=42000,fault=6000,slot=3000,short_on=400,long_on=2000,group_separator=4000,delimiter=8000),entries=entries)
+data=json.dumps(spec,indent=2)+'\n';BASE.mkdir(exist_ok=True);(BASE/'fault-registry.json').write_text(data);digest=hashlib.sha256(data.encode()).hexdigest()
+(SRC/'registry.rs').write_text('pub const HASH:&str="'+digest+'";\npub fn lookup(reason:u32,op:u32,result:u32)->u8 {\n    match (reason,op,result) {\n'+'\n'.join(arms)+'\n        _=>0,\n    }\n}\n')
+(BASE/'fault-codes.md').write_text('# SYS failure words\n\nRegistry SHA-256: `'+digest+'`\n\nRead two identical complete words. S = 0.4 seconds ON; L = 2 seconds ON. Each slot is 3 seconds. A 6-second flutter/dark prefix precedes four symbols, 4 extra seconds dark, four symbols, then 8 extra seconds dark. Frames repeat every 42 seconds after a 500ms transition. An uncertain/missing symbol, parity error or differing repetition is inconclusive. Parity cannot detect every multi-symbol error. No nearest-match decoding.\n\n`SSSS / SSSS`: unavailable/invalid provenance.\n\n| ID | Word | Producer | Operation | Exact reported condition | Source |\n|---|---|---|---|---|---|\n'+''.join(f"| {e['id']} | {e['word']} | {e['producer']} | {e['operation']} | {e['predicate']} | {e['source']} |\n" for e in entries)+'\nTimeouts report missing progress, not the operation that caused it. Monitor records prove receipt of a fault, not its hardware cause. Static light or generic flutter without a word is incomplete reporting.\n')
+(SRC/'fault_timing.rs').write_text(''.join(f'pub const {k.upper()}_MS:u64={v};\n' for k,v in spec['timing_ms'].items()))
+print(len(entries),digest)
+if __name__=='__main__':pass

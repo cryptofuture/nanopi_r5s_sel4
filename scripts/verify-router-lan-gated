@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+import filecmp
+import json
+import sys
+from pathlib import Path
+from xml.etree import ElementTree as ET
+from image import verify
+from policy import sha256
+from lan_gated_profile import PROFILE
+
+root = Path(__file__).resolve().parents[1]
+a,b = (Path(s).resolve() for s in sys.argv[1:])
+for relative in ["r5s-router.img", "wan-manifest.json", "source-hashes.json", "wan-dhcp/system.system",
+                 *["wan-dhcp/"+s for s in ("router.elf","driver.elf","probe.elf","heartbeat.elf","loader.img","u-boot-rockchip.bin")]]:
+    if not filecmp.cmp(a/relative,b/relative,shallow=False):
+        raise SystemExit("Build mismatch: " + relative)
+manifest = verify(a/"r5s-router.img")
+if manifest["profile"] != PROFILE:
+    raise SystemExit("Wrong profile")
+system=ET.parse(a/"wan-dhcp/system.system")
+pds={p.get("name"):p for p in system.findall("protection_domain")}
+if set(pds) != {"wan","gmac","router","heartbeat","health"}:
+    raise SystemExit("Unexpected protection domains")
+layout=json.loads((a/"layout-report.json").read_text())
+pages=[obj["physical"] for obj in layout["capdl_objects"] if obj["physical"] is not None]
+mmio=[v for v in pages if not 0x20000000<=v<0x40000000]
+expected={0xfe770000,0xfe750000,0xfe2a0000,0xfe2a1000,0xfdc60000,0xfdc20000,0xfdd20000,0xfdd00000,0xfdd60000}
+if set(mmio)!=expected or len(mmio)!=len(expected):
+    raise SystemExit("Unexpected Device frame allocations")
+for owner,names in {"router":{"router_ingress","router_status","link_status","probe_status"},
+                    "wan":{"trace_sync","link_status","probe_status","queues","router_ingress"}}.items():
+    if {m.get("mr") for m in pds[owner].findall("map")}!=names:
+        raise SystemExit("Unexpected map in "+owner)
+report=(a/"wan-dhcp/microkit-report.txt").read_text()
+for pd,count in [("wan",8),("router",64)]:
+    if report.count("Page(4 KiB): "+chr(39)+"frame_"+pd+"_stack_")!=count:
+        raise SystemExit("Wrong stack allocation: "+pd)
+for page in range(0x24000000,0x24040000,4096):
+    if pages.count(page)!=1:
+        raise SystemExit("Incorrect GMAC pool frame")
+config=(a/"wan-dhcp/build/.config").read_text().splitlines()
+for option in ("PCI","SPL_PCI","NET"):
+    if "# CONFIG_"+option+" is not set" not in config:
+        raise SystemExit("Check firmware "+option)
+print(json.dumps(dict(profile=PROFILE,image_sha256=sha256(a/"r5s-router.img"),device_pages=list(map(hex,sorted(mmio))),identical_builds=True)))

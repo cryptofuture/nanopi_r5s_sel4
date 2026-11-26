@@ -1,0 +1,19 @@
+[package]
+name = "r5s-heartbeat"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+
+[dependencies]
+smoltcp = { version = "=0.12.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-dhcpv4", "socket-icmp"] }
+r5s-router-core = { path = "../../router-core" }
+sel4-microkit = { path = "../../vendor/rust-sel4/crates/sel4-microkit" }
+
+[features]
+fault-injection = []
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 2
+

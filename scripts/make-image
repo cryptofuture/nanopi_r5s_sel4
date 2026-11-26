@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import sys
+from image import assemble
+
+if len(sys.argv) != 2:
+    sys.exit('Usage: scripts/make-image OUTPUT.img (regular file only)')
+try:
+    assemble(Path(__file__).resolve().parents[1], Path(sys.argv[1]))
+except (ValueError, OSError) as error:
+    sys.exit(f'Image NOT produced: {error}')

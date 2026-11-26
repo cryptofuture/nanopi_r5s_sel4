@@ -1,0 +1,9 @@
+#!/bin/sh
+# Source from the repository root after preparing the local tools cache.
+export PATH="$PWD/tools/venv/bin:$PWD/tools/host/usr/bin:$PWD/tools/host/usr/sbin:$PWD/tools/arm-gnu-toolchain-12.2.rel1-$(uname -m)-aarch64-none-elf/bin:$PATH"
+export LD_LIBRARY_PATH="$PWD/tools/host/usr/lib/$(uname -m)-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export BISON_PKGDATADIR="$PWD/tools/host/usr/share/bison"
+export M4="$PWD/tools/host/usr/bin/m4"
+export SWIG_LIB="$PWD/tools/host/usr/share/swig/4.3.0"
+export RUSTUP_TOOLCHAIN=nightly-2026-08-21
+export LIBCLANG_PATH="$PWD/tools/host/usr/lib/$(uname -m)-linux-gnu"

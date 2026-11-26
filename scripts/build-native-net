@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import diagnostics
+import handoff_trace as trace
+from image import assemble_files
+from policy import sha256
+ROOT=trace.ROOT
+BASE=ROOT/'out/native-net'
+PROFILE='runtime-baseline-v2'
+PRESERVED={**trace.BASELINES,
+'out/handoff-trace/r5s-boot-trace.img':'4cfe4737605b507a65394f931b5415aa1bbcdc003f5aac33fe097a34d7b7789d',
+'out/handoff-trace/r5s-preflight-stop.img':'af697706fc81638b13c8da48b61207891c27e8a021522c67c5670f8576b33c2a',
+'out/handoff-trace/r5s-loader-entry-stop.img':'210b64b5c5b187162580adcd7072ec79cec8b9bc2008773483b97add9a47edd0'}
+
+def early_header():
+    header=(ROOT/'firmware/r5s_trace.h').read_text().split('static inline void r5s_pulses')[0]
+    def frame(name):
+        return '\n'.join(f'    r5s_led({int(on)}); R5S_WAIT({duration});' for on,duration in diagnostics.SPEC['states'][name])
+    return header+'static inline void r5s_checkpoint(unsigned int code) {\n(void)code;\n'+frame('WAIT')+'\n}\nstatic inline void r5s_error(unsigned int code) {\n(void)code; for (;;) {\n'+frame('FAULT')+'\n}}\n#endif\n'
+
+def main():
+    for path,digest in PRESERVED.items(): trace.require(sha256(ROOT/path)==digest,f'Preserved input changed: {path}')
+    diagnostics.generate()
+    work=BASE/'work'; work.mkdir(parents=True,exist_ok=True)
+    (BASE/'logs').mkdir(exist_ok=True)
+    lock=json.loads((ROOT/'sources.lock').read_text())
+    trace.clone_inputs(work,lock)
+    signature=hashlib.sha256(Path(__file__).read_bytes()+early_header().encode()+(ROOT/'pds/diagnostics/src/main.rs').read_bytes()+(ROOT/'pds/diagnostics/src/health.rs').read_bytes()+(ROOT/'pds/diagnostics/src/display.rs').read_bytes()).hexdigest()
+    stamp=work/'native-prepared'
+    if not stamp.exists():
+        trace.instrument(work,0)
+        for path in (work/'microkit/loader/src/r5s_trace.h',work/'microkit/monitor/src/r5s_trace.h',work/'sel4/include/r5s_trace.h'): path.write_text(early_header())
+        stamp.write_text(signature)
+    trace.require(stamp.read_text()==signature,'Build inputs changed; preserve and move the native work directory before rebuilding')
+    sdk=work/'microkit/release/microkit-sdk-2.4.0'
+    if not (sdk/'board/nanopi_r5s_trace/debug/elf/initialiser.elf').exists():
+        trace.run([sys.executable,ROOT/'scripts/build-trace-sdk',work],BASE/'logs/sdk.log')
+    project=work/'diagnostics'
+    shutil.copytree(ROOT/'pds/diagnostics',project,ignore=shutil.ignore_patterns('target'),dirs_exist_ok=True)
+    manifest=project/'Cargo.toml'
+    manifest.write_text(manifest.read_text().replace('../../vendor/rust-sel4/crates/sel4-microkit',str(ROOT/'vendor/rust-sel4/crates/sel4-microkit')))
+    target=BASE/'aarch64-sel4.json'
+    shutil.copyfile(ROOT/'vendor/rust-sel4/support/targets/aarch64-sel4.json',target)
+    trace.run(['cargo','build','--manifest-path',manifest,'--release','--locked','-Zbuild-std=core,alloc,compiler_builtins','-Zbuild-std-features=compiler-builtins-mem','-Zjson-target-spec','--target',target],BASE/'logs/pd.log',env=dict(os.environ,SEL4_INCLUDE_DIRS=str(sdk/'board/nanopi_r5s_trace/debug/include')))
+    for src,dst in [('r5s-heartbeat.elf','heartbeat.elf'),('health.elf','health.elf')]:shutil.copyfile(project/'target/aarch64-sel4/release'/src,BASE/dst)
+    (BASE/'system.system').write_text('''<system>
+<memory_region name="gpio4" size="0x1000" phys_addr="0xfe770000" />
+<memory_region name="trace_sync" size="0x1000" />
+<protection_domain name="heartbeat" priority="110" budget="100" period="1000">
+<program_image path="heartbeat.elf" />
+<map mr="gpio4" vaddr="0x40000000" perms="rw" cached="false" />
+<map mr="trace_sync" vaddr="0x40001000" perms="rw" cached="true" />
+</protection_domain>
+<protection_domain name="health" priority="100" budget="100" period="1000">
+<program_image path="health.elf" />
+<map mr="trace_sync" vaddr="0x40001000" perms="rw" cached="true" />
+</protection_domain>
+</system>
+''')
+    output=BASE/PROFILE; output.mkdir(exist_ok=True)
+    board=sdk/'board/nanopi_r5s_trace/debug/elf'
+    for name in ('loader','sel4','initialiser','monitor'):shutil.copyfile(board/f'{name}.elf',output/f'{name}.elf')
+    payload=output/'loader.img'
+    trace.run([sdk/'bin/microkit',BASE/'system.system','--board','nanopi_r5s_trace','--config','debug','--search-path',BASE,'-o',payload,'-r',output/'microkit-report.txt'],BASE/'logs/microkit.log')
+    trace.build_uboot(BASE,PROFILE,payload,0,early_header())
+    report=trace.layout(BASE,sdk,payload,output/'loader.elf',output)
+    report['scheduling']={'diagnostics':{'priority':110,'budget_us':100,'period_us':1000},'health':{'priority':100,'budget_us':100,'period_us':1000},'strategy':'continuously runnable bounded scheduling contexts; no IPC wait; counter polling; 10ms sticky liveness fault'}
+    report['ethernet']='no GMAC mapping, clocks, reset or DMA initialization'
+    (BASE/'layout-report.json').write_text(json.dumps(report,indent=2)+'\n')
+    patches=BASE/'patches';patches.mkdir(exist_ok=True)
+    for name in ('sel4','microkit'):
+        (patches/f'{name}.patch').write_bytes(subprocess.check_output(['git','-C',str(work/name),'diff','--binary']))
+    for path in ('firmware/r5sboot-trace.c','firmware/r5s_enter.S','protocol/diagnostics-v2.json','pds/diagnostics/src/main.rs','pds/diagnostics/src/health.rs','pds/diagnostics/src/display.rs','scripts/build-native-net'):
+        shutil.copyfile(ROOT/path,patches/Path(path).name)
+    (patches/'early-v2.h').write_text(early_header())
+    patch_hash=hashlib.sha256(b''.join(p.read_bytes() for p in sorted(patches.iterdir()))).hexdigest()
+    policy=output/'boot.txt'
+    policy.write_text('Native runtime baseline diagnostics-v2. No Ethernet or DMA.\nEarly components WAIT; early detected errors FAULT.\nMonitor releases LED ownership before Rust supervisor; only supervisor subsequently writes GPIO.\nREADY requires fresh health PD progress, expected counter frequency and scheduler polling.\nNo external IO proof in this profile. No runtime storage writes.\n')
+    uboot=output/'u-boot-rockchip.bin'
+    manifest=dict(format=4,profile=PROFILE,hardware_tested=False,ethernet_enabled=False,dma_enabled=False,diagnostics=diagnostics.SPEC,load_address=0x30000000,ram=[0x20000000,0x40000000],patches_sha256=patch_hash,loader=dict(size=payload.stat().st_size,sha256=sha256(payload)),uboot=dict(size=uboot.stat().st_size,sha256=sha256(uboot)),policy_sha256=sha256(policy),lock_sha256=sha256(ROOT/'sources.lock'),sources=lock['sources'])
+    seed=sha256(payload)+sha256(uboot)
+    images=[BASE/f'r5s-{PROFILE}{suffix}.img' for suffix in ('','.reproduced')]
+    for image in images:
+        if not image.exists():assemble_files(image,uboot,[(payload,'loader.img'),(policy,'boot.txt')],manifest,seed)
+        else:
+            from image import verify
+            trace.require(verify(image)==manifest,'Existing native image differs from build')
+    trace.require(sha256(images[0])==sha256(images[1]),'Image assembly is not reproducible')
+    (BASE/'SHA256SUMS').write_text(f'{sha256(images[0])}  {images[0].name}\n')
+    (BASE/'ARTIFACTS.json').write_text(json.dumps(dict(built={images[0].name:sha256(images[0])},hardware_tested=False,blocked_profiles={'gmac-link':'captured PHY/clock/reset configuration unverified','gmac-rawio':'board evidence and safe DMA Normal-memory mapping/ownership unresolved'},preserved=PRESERVED,assembly_reproducible=True,full_toolchain_rebuilt_twice=False),indent=2)+'\n')
+    for path,digest in PRESERVED.items():trace.require(sha256(ROOT/path)==digest,f'Preserved input changed: {path}')
+    print(images[0],sha256(images[0]))
+
+if __name__=='__main__':main()

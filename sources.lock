@@ -1,0 +1,249 @@
+{
+  "format": 1,
+  "sources": {
+    "microkit": {
+      "url": "https://github.com/seL4/microkit",
+      "commit": "b2558a900c036bded0b7c54437fcebbdff96f937"
+    },
+    "sel4": {
+      "url": "https://github.com/seL4/seL4",
+      "commit": "62e345c240a15671484530b4e6e069ce266c28d7"
+    },
+    "u-boot": {
+      "url": "https://github.com/u-boot/u-boot",
+      "commit": "127a42c7257a6ffbbd1575ed1cbaa8f5408a44b3"
+    },
+    "rust-sel4": {
+      "url": "https://github.com/seL4/rust-sel4",
+      "commit": "c819c27b076130cba9821c4555f23773e4b0bffd"
+    },
+    "rkbin": {
+      "url": "https://github.com/rockchip-linux/rkbin",
+      "commit": "3e288fe814e059dd06833495f845cab04ac20a5c"
+    }
+  },
+  "files": {
+    "vendor/rkbin/bin/rk35/rk3568_bl31_v1.46.elf": "c81ac7e8e1fd727cf7f0db62a9aaea760bde2b270e34d98eb264a264b86df749",
+    "vendor/rkbin/bin/rk35/rk3568_ddr_1560MHz_v1.26.bin": "acb4e054298f0f0c8471dd3d45de07a1c77b67e687ec6e77ede365a087f1d95a",
+    "vendor/rkbin/LICENSE": "1b3cfbd212ef0e645b34aa6beee07343ce954a4f512338f12317ab297a9c9829",
+    "tools/arm-toolchain.tar.xz": "62d66e0ad7bd7f2a183d236ee301a5c73c737c886c7944aa4f39415aab528daf"
+  },
+  "rust": "nightly-2026-08-21",
+  "compiler": "Arm GNU Toolchain 12.2.Rel1 aarch64-none-elf",
+  "tested_host": "Debian 13 x86_64",
+  "microkit": "2.4.0",
+  "toolchain_url": "https://sel4-toolchains.s3.us-east-2.amazonaws.com/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz%3Frev%3D28d5199f6db34e5980aae1062e5a6703%26hash%3DF6F5604BC1A2BBAAEAC4F6E98D8DC35B",
+  "host_debs": {
+    "bison_2%3a3.8.2+dfsg-1+b2_amd64.deb": {
+      "sha256": "ce6eb1f7aad18850e32d223a68f54bcbe756d74f138c8ec5460ad9d220f4d335",
+      "url": "https://deb.debian.org/debian/pool/main/b/bison/bison_3.8.2+dfsg-1+b2_amd64.deb"
+    },
+    "device-tree-compiler_1.7.2-2+b1_amd64.deb": {
+      "sha256": "1d2ee77671eb76db21ad455a0e0211ece67f57c6d12b7501b92876bbcea390d6",
+      "url": "https://deb.debian.org/debian/pool/main/d/device-tree-compiler/device-tree-compiler_1.7.2-2+b1_amd64.deb"
+    },
+    "dosfstools_4.2-1.2_amd64.deb": {
+      "sha256": "628551496a02e80eee83054b9c696b06ba8177159bf0afe9a5b4ab2fb94b1b41",
+      "url": "https://deb.debian.org/debian/pool/main/d/dosfstools/dosfstools_4.2-1.2_amd64.deb"
+    },
+    "flex_2.6.4-8.2+b4_amd64.deb": {
+      "sha256": "75f963765232c356d0a2fb70e780dfa9de2425aca036ec60eefb7fc98a2c905b",
+      "url": "https://deb.debian.org/debian/pool/main/f/flex/flex_2.6.4-8.2+b4_amd64.deb"
+    },
+    "gdisk_1.0.10-2_amd64.deb": {
+      "sha256": "a64944b38e8477bf23b9a0ffb6fc653c8847facb1f851864b1a5c40a931456d2",
+      "url": "https://deb.debian.org/debian/pool/main/g/gdisk/gdisk_1.0.10-2_amd64.deb"
+    },
+    "libclang1-19_1%3a19.1.7-3+b1_amd64.deb": {
+      "sha256": "4e7e2a5fe236e280d32fb529350b3c1cfd9410a964629a57ea079a314c45d7a3",
+      "url": "https://deb.debian.org/debian/pool/main/l/llvm-toolchain-19/libclang1-19_19.1.7-3+b1_amd64.deb"
+    },
+    "libfdt1_1.7.2-2+b1_amd64.deb": {
+      "sha256": "8e37034d7864807ae2063efcc82fc79aad59069546212e6e0908ed67f9f7e107",
+      "url": "https://deb.debian.org/debian/pool/main/d/device-tree-compiler/libfdt1_1.7.2-2+b1_amd64.deb"
+    },
+    "libfl2_2.6.4-8.2+b4_amd64.deb": {
+      "sha256": "4c6946a46df35fbf044a376f398499205d160d814806e9bec6cc7cc7cb554e77",
+      "url": "https://deb.debian.org/debian/pool/main/f/flex/libfl2_2.6.4-8.2+b4_amd64.deb"
+    },
+    "libpopt0_1.19+dfsg-2_amd64.deb": {
+      "sha256": "07f649b706852af937654295697dcfc7858f3295718ec18681dce1704663e4f2",
+      "url": "https://deb.debian.org/debian/pool/main/p/popt/libpopt0_1.19+dfsg-2_amd64.deb"
+    },
+    "libxml2-utils_2.12.7+dfsg+really2.9.14-2.1+deb13u3_amd64.deb": {
+      "sha256": "cfa40541f9b314491c53b6c63e23ee1a2afa2ac309e6ca379c1081ef2b62e773",
+      "url": "https://deb.debian.org/debian/pool/main/libx/libxml2/libxml2-utils_2.12.7+dfsg+really2.9.14-2.1+deb13u3_amd64.deb"
+    },
+    "libxml2_2.12.7+dfsg+really2.9.14-2.1+deb13u3_amd64.deb": {
+      "sha256": "e0c6b63ce4602a036a526f60fe5e6c1586710688058d98fc1001b9b3147b7efd",
+      "url": "https://deb.debian.org/debian/pool/main/libx/libxml2/libxml2_2.12.7+dfsg+really2.9.14-2.1+deb13u3_amd64.deb"
+    },
+    "m4_1.4.19-8_amd64.deb": {
+      "sha256": "221b3e224708c1da2a1a88b6824380593579b2254ae7d914afa14cbd5d343334",
+      "url": "https://deb.debian.org/debian/pool/main/m/m4/m4_1.4.19-8_amd64.deb"
+    },
+    "mtools_4.0.48-1_amd64.deb": {
+      "sha256": "e7069109ce49f5a450caeca681e454f24dc412f9fdb289cde54e115162203760",
+      "url": "https://deb.debian.org/debian/pool/main/m/mtools/mtools_4.0.48-1_amd64.deb"
+    },
+    "swig_4.3.0-1_amd64.deb": {
+      "sha256": "fe8749993e720a232582c13a5ddcaeb074c435a1f1c6ed2ffe0db597a972a069",
+      "url": "https://deb.debian.org/debian/pool/main/s/swig/swig_4.3.0-1_amd64.deb"
+    }
+  },
+  "compatibility": "Compiled together; physical DDR/BL31 compatibility untested; BL32 not included",
+  "python_artifacts": {
+    "attrs-26.1.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl",
+      "sha256": "c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309"
+    },
+    "autopep8-2.3.2-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/9e/43/53afb8ba17218f19b77c7834128566c5bbb100a0ad9ba2e8e89d089d7079/autopep8-2.3.2-py2.py3-none-any.whl",
+      "sha256": "ce8ad498672c845a0c3de2629c15b635ec2b05ef8177a6e7c91c74f3e9b51128"
+    },
+    "beautifulsoup4-4.15.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/88/c6/92fcd42f1ba33e1184263f25bfabf3d27c383410470f169e4b8163bf9c17/beautifulsoup4-4.15.0-py3-none-any.whl",
+      "sha256": "d6f88de62e1d4e38ecb1077eb9724cd0eff29d2a08ca16a401e9b9e93f117cf9"
+    },
+    "bs4-0.0.2-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/51/bb/bf7aab772a159614954d84aa832c129624ba6c32faa559dfb200a534e50b/bs4-0.0.2-py2.py3-none-any.whl",
+      "sha256": "abf8742c0805ef7f662dce4b51cca104cffe52b835238afc169142ab9b3fbccc"
+    },
+    "cmake_format-0.6.13-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/4a/40/0ca7c62dc4b9af58ca32da8e6d87ee222f5bb551c17ef22900b2f81b998e/cmake_format-0.6.13-py3-none-any.whl",
+      "sha256": "ec7ed949101e5f0b7bc19317d122b83ccbc28fd766c41c93094845719667c56e"
+    },
+    "cmakelang-0.6.13-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/86/a8/c4676cac062d133c6b909d7def80a3194162597968953a3291b309878721/cmakelang-0.6.13-py3-none-any.whl",
+      "sha256": "764b9467195c7c36453d60a829f30229720d26c7dffd41cb516b99bd9c7daf4e"
+    },
+    "distlib-0.4.4-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/c1/2b/238f02a4927fa2e27aa995371d240a468b52e42eae44a678434aff736b38/distlib-0.4.4-py2.py3-none-any.whl",
+      "sha256": "cf09d55b1e85a89576b036aeb71550bfd68320f3f21761ca329eadadad918638"
+    },
+    "filelock-4.2.10-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/ef/90/5d0096a325aa0f83ba7a3968bfb485b67e32c947bdf9cd0fcb4b485be718/filelock-4.2.10-py3-none-any.whl",
+      "sha256": "9479aaeb4db20b5a53e3da28493edd24720b66b8a0b84030aa56ccdf243d6857"
+    },
+    "future-1.0.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/da/71/ae30dadffc90b9006d77af76b393cb9dfbfc9629f339fc1574a1c52e6806/future-1.0.0-py3-none-any.whl",
+      "sha256": "929292d34f5872e70396626ef385ec22355a1fae8ad29e1a734c3e43f9fbc216"
+    },
+    "guardonce-2.4.0-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/7d/05/fec26708b5292a8c579a3393c498d46eb9e0f78f2a9b45c3058d4911aa1f/guardonce-2.4.0-py2.py3-none-any.whl",
+      "sha256": "325b5705148ca82b0422439e94456dd3b1a561556e2cc0e24a1acc1b8916f89f"
+    },
+    "jinja2-3.1.6-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl",
+      "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+    },
+    "jsonschema-4.26.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/69/90/f63fb5873511e014207a475e2bb4e8b2e570d655b00ac19a9a0ca0a385ee/jsonschema-4.26.0-py3-none-any.whl",
+      "sha256": "d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce"
+    },
+    "jsonschema_specifications-2025.9.1-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/41/45/1a4ed80516f02155c51f51e8cedb3c1902296743db0bbc66608a0db2814f/jsonschema_specifications-2025.9.1-py3-none-any.whl",
+      "sha256": "98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe"
+    },
+    "libarchive_c-5.3-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/88/3f/ff00c588ebd7eae46a9d6223389f5ae28a3af4b6d975c0f2a6d86b1342b9/libarchive_c-5.3-py3-none-any.whl",
+      "sha256": "651550a6ec39266b78f81414140a1e04776c935e72dfc70f1d7c8e0a3672ffba"
+    },
+    "lxml-6.1.3-cp313-cp313-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/ac/7d/8bf1fd8bae8247743968bb76d027a1ac5bd2c4b44495fba6a71b30d10706/lxml-6.1.3-cp313-cp313-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "d85dfab42dd672f87a7f76e9de7172962aee69fa12044f0d6e1a23cbd53fb80e"
+    },
+    "markupsafe-3.0.4-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/63/e0/cec6865dfe88cb48fedd4b20aed6af5158e41092adcbf3e028bcc6ec2108/markupsafe-3.0.4-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "434139499bb20b502ed3baa1f169e618f924a97e7a777fea1a49446d80106cf6"
+    },
+    "ninja-1.13.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/6e/53/ebfed7b689c338dd8ebeec9c0730c8d56821292f14e2536e5f3ef1a05744/ninja-1.13.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+      "sha256": "65a24341b5ac09fcadcc37082660be40a94174e51a937fabf6e2cae26225fa2c"
+    },
+    "packaging-26.3-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/63/34/ba1c580383c9eada3711951fef0795c80b829a078d72188184bcab9dd527/packaging-26.3-py3-none-any.whl",
+      "sha256": "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c"
+    },
+    "pexpect-4.9.0-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/9e/c3/059298687310d527a58bb01f3b1965787ee3b40dce76752eda8b44e9a2c5/pexpect-4.9.0-py2.py3-none-any.whl",
+      "sha256": "7236d1e080e4936be2dc3e326cec0af72acf9212a7e1d060210e70a47e253523"
+    },
+    "platformdirs-4.14.5-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/7c/ae/ecbbbfd0e4343a6a521d49b3c8656fb4643dee2a4f6eaf941cf3280391a8/platformdirs-4.14.5-py3-none-any.whl",
+      "sha256": "8e778c6fa421516f4d3369449f8df3b0e1b72c0e0005fe88e3ec772d0a14e750"
+    },
+    "ply-3.11-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/a3/58/35da89ee790598a0700ea49b2a66594140f44dec458c07e8e3d4979137fc/ply-3.11-py2.py3-none-any.whl",
+      "sha256": "096f9b8350b65ebd2fd1346b12452efe5b9607f7482813ffca50c22722a807ce"
+    },
+    "protobuf-3.20.3-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/8d/14/619e24a4c70df2901e1f4dbc50a6291eb63a759172558df326347dce1f0d/protobuf-3.20.3-py2.py3-none-any.whl",
+      "sha256": "a7ca6d488aa8ff7f329d4c545b2dbad8ac31464f1d8b1c87ad1346717731e4db"
+    },
+    "psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/b5/70/5d8df3b09e25bce090399cf48e452d25c935ab72dad19406c77f4e828045/psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "076a2d2f923fd4821644f5ba89f059523da90dc9014e85f8e45a5774ca5bc6f9"
+    },
+    "ptyprocess-0.7.0-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/22/a6/858897256d0deac81a172289110f31629fc4cee19b6f01283303e18c8db3/ptyprocess-0.7.0-py2.py3-none-any.whl",
+      "sha256": "4b41f3967fce3af57cc7e94b888626c18bf37a083e3651ca8feeb66d492fef35"
+    },
+    "pycodestyle-2.15.0-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/56/e2/480bcdb153feecde4d736b18c908c7eee4846f11d7547d2e0c71499af630/pycodestyle-2.15.0-py2.py3-none-any.whl",
+      "sha256": "12fd2f73c7b8ee8845a0431111df8faf4c1a07d6e64e2ee7f0c74014dab14181"
+    },
+    "pyelftools-0.33-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/46/2a/f9697576603dae937727827505a6126a066affb227034e77e6f9068910da/pyelftools-0.33-py3-none-any.whl",
+      "sha256": "f215ad5f47d3f1373a21496a6c9e0707c622840d0622f23ff7ce08678b020036"
+    },
+    "pyfdt-0.3.tar.gz": {
+      "url": "https://files.pythonhosted.org/packages/a5/bb/9336b4425eaad5334dcadc7eb23c7cb77047ea762b1d75c285151c5b8332/pyfdt-0.3.tar.gz",
+      "sha256": "61601c2005ff394a25a6c84c6da2088bbf888328038400d27e4eeb1b04b9f4f0"
+    },
+    "python_discovery-1.9.5-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/ac/35/25bd092ca8a7e71192afdca67fbff4f797da74408e74ac3626e13b409ec0/python_discovery-1.9.5-py3-none-any.whl",
+      "sha256": "a1fae8fca11e4bc61e38491c2aafff29e430b3c5e272d51ae52fb895bc4c0fac"
+    },
+    "pyyaml-6.0.3-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/74/27/e5b8f34d02d9995b80abcef563ea1f8b56d20134d8f4e5e81733b1feceb2/pyyaml-6.0.3-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6"
+    },
+    "referencing-0.37.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/2c/58/ca301544e1fa93ed4f80d724bf5b194f6e4b945841c5bfd555878eea9fcb/referencing-0.37.0-py3-none-any.whl",
+      "sha256": "381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231"
+    },
+    "rpds_py-2026.9.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl": {
+      "url": "https://files.pythonhosted.org/packages/a0/36/76fab39973ee11e7f9f357c55138197bb01c86f6502cb76487e3b4f42db0/rpds_py-2026.9.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "sha256": "7868b85224291c6cb6759f9b5adb9745f486d226f62b16a614dd5a2a5ab2b35b"
+    },
+    "sel4_deps-0.9.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/74/0b/2474450fe188474ab4d1f50c84e3ccf6e98097d466bb6f643e5d654b434e/sel4_deps-0.9.0-py3-none-any.whl",
+      "sha256": "d2a4c5b1d8aca9ccc7d36905f9c36c576dba916eaf01ebff956ad9394c8c2225"
+    },
+    "setuptools-84.2.1-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/ef/55/6dc6d6bb953bdfc52519a0059592c52b6e3b8ad51cf8256dffceb55b0610/setuptools-84.2.1-py3-none-any.whl",
+      "sha256": "ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2"
+    },
+    "sh-2.4.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/23/dd/6b9aceecddbb3df894003d6a5005bd90bce3cf4743c28c406ebecc8d80f6/sh-2.4.0-py3-none-any.whl",
+      "sha256": "98eba32eeb5ecdd310668737d7461e668afc42b273550d0bc198a1c5c2b1ab36"
+    },
+    "six-1.17.0-py2.py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl",
+      "sha256": "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274"
+    },
+    "soupsieve-4.1.1-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/cd/65/7fae69a095696195334a934eab23aeb12e2715e6c3f08025d2f91942750e/soupsieve-4.1.1-py3-none-any.whl",
+      "sha256": "8ff3422dab0b720fb667ee79864d80531a0e57994a13eb701697719ffcb751f6"
+    },
+    "typing_extensions-4.16.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"
+    },
+    "virtualenv-21.15.6-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/0a/63/fd514dee3159f74a96ac01beb8f460b65e4ef0b972f63f4fe9f0cd2aa0e3/virtualenv-21.15.6-py3-none-any.whl",
+      "sha256": "4b99ab9b95ff11043939bb4cad2fa0449175fa5a478372864f62160cb6c1a7ed"
+    }
+  }
+}

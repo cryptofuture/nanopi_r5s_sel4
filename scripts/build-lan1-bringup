@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import sys
+
+import network_uboot as trace
+from image import assemble_files, verify
+from policy import check_ram, sha256
+from wan_stack_profile import check_stack
+from dual_lan_profile import SMP_SCHEDULES, WORKER_SCHEDULES, b51_memory, optimization_options, zc_pool_manifest, STAGES, services, dns_option, fallback_option, scheduling_profile
+
+root = trace.ROOT
+base = Path(sys.argv[1]).resolve()
+lan_repair = len(sys.argv) == 3 and sys.argv[2].startswith('--lan-repair=')
+if lan_repair:
+    sys.argv[2] = '--repair=' + sys.argv[2].split('=', 1)[1]
+repair = sys.argv[2].removeprefix('--repair=') if len(sys.argv)==3 and sys.argv[2].startswith('--repair=') else None
+diagnostic = os.environ.get('R5S_LAN1_TX_DIAGNOSTIC') == '1'
+no_close = os.environ.get('R5S_LAN1_TX_NO_CLOSE') == '1'
+if (diagnostic or no_close) and not (lan_repair and repair == 'lan1'):
+    sys.exit('The TX diagnostic requires --lan-repair=lan1')
+dual = sys.argv[2:] == ['--lan-dhcp'] or repair is not None
+subprocess.run([root / 'scripts/build-lan1-layout', base, *sys.argv[2:]], check=True)
+profile = 'rtl8125-lan-repair' if lan_repair else 'lan-dhcp-diagnostics-v2' if repair is not None else 'lan-dhcp-dma' if dual else 'lan1-bringup'
+payload = base / 'layout.bin'
+output = base / profile
+output.mkdir()
+sdk = root / 'out/router-integrated/nc-kernel-f/mapping-check/sdk'
+schedule = scheduling_profile(os.environ.get('R5S_DUAL_LAN_STAGE'))
+smp = schedule in SMP_SCHEDULES
+if smp:
+    sdk = base / 'work/microkit/release/microkit-sdk-2.4.0'
+options = optimization_options()
+lan1, lan2, shared_pool = b51_memory(options.get("R5S_B51_RING", "64"), options.get("R5S_ZC_CACHE", "nc"))
+shared_pa, _, _, padding_pa = shared_pool
+sdk_config = options.get("R5S_SDK_CONFIG", "debug")
+board = sdk / f'board/nanopi_r5s_trace/{sdk_config}'
+check_stack(base / 'system.system', base / 'microkit-report.txt')
+lock = json.loads((root / 'sources.lock').read_text())
+trace.clone_inputs(base / 'work', lock)
+early = runpy.run_path(str(root / 'scripts/build-native-net'))['early_header']()
+trace.build_uboot(base, profile, payload, 0, early)
+relative = 'microkit/build/nanopi_r5s_trace/debug/sel4/build/gen_headers/plat/machine/devices_gen.h'
+target = base / 'work' / relative
+target.parent.mkdir(parents=True, exist_ok=True)
+if not smp:
+    shutil.copyfile(root / 'out/native-net/work' / relative, target)
+shutil.copyfile(base / 'microkit-report.txt', output / 'microkit-report.txt')
+from xml.etree.ElementTree import parse
+mmio = set()
+for region in parse(base / 'system.system').iter('memory_region'):
+    start = int(region.get('phys_addr', '0'), 0)
+    if start >= 0xf0000000:
+        mmio.update(range(start, start + int(region.get('size'), 0), 4096))
+layout = trace.layout(base, sdk, payload, board / 'elf/loader.elf', output, allowed_mmio=mmio, cores=4 if smp else 1, sdk_config=sdk_config)
+nc_end = padding_pa + 0x100000 if schedule in WORKER_SCHEDULES else shared_pa
+dma_ranges = [(0x24000000, 0x24040000), (lan1[1], nc_end)]
+for low, high in dma_ranges:
+    check_ram((low, high))
+    for name, start, end in layout['loader_regions']:
+        if low < end and start < high:
+            sys.exit(f'DMA allocation overlaps {name}')
+(base / 'layout-report.json').write_text(json.dumps(layout, indent=2)+'\n')
+policy = output / 'boot.txt'
+policy.write_text('LAN1 B51 one-shot ARP DMA diagnostic at 10.44.1.1/24. WAN DHCP baseline. Physical acceptance pending.\n\n' +
+                  (root / 'firmware/rtl_nic/LICENSE').read_text())
+uboot = output / 'u-boot-rockchip.bin'
+manifest = dict(format=7, profile=profile, hardware_tested=False, lan2_enabled=False,
+                services=['wan-dhcp-client','wan-gateway-probes','lan1-arp'], lan1_pool=lan1,
+                load_address=0x30000000, ram=[0x20000000,0x40000000],
+                loader=dict(size=payload.stat().st_size,sha256=sha256(payload)),
+                uboot=dict(size=uboot.stat().st_size,sha256=sha256(uboot)),
+                policy_sha256=sha256(policy),lock_sha256=sha256(root/'sources.lock'),sources=lock['sources'])
+if dual:
+    policy.write_text('WAN DHCP client and separate LAN DHCP pools for B51 endpoints. Physical acceptance pending.\n\n'
+                      + (root / 'firmware/rtl_nic/LICENSE').read_text())
+    manifest.update(lan2_enabled=True, lan2_pool=lan2,
+                    policy_sha256=sha256(policy), services=['wan-dhcp-client','wan-gateway-probes','lan1-dhcp','lan2-dhcp'])
+if repair is not None:
+    manifest.update(lan_startup=repair, fault_diagnostics=2)
+    for port in ('lan1','lan2'):
+        if repair not in (port, 'both'):
+            manifest.pop(port+'_pool')
+            manifest['services'].remove(port+'-dhcp')
+    manifest['lan2_enabled'] = repair in ('lan2','both')
+if no_close:
+    manifest['lan1_tx_mode'] = 'no-close-v3'
+    manifest['lan1_tx_descriptor_bytes'] = 32
+if diagnostic:
+    manifest['b51_experiment'] = os.environ.get('R5S_B51_EXPERIMENT', 'observe')
+    manifest['b51_status_version'] = 2
+    policy.write_text('WAN DHCP and one bounded LAN1 broadcast. Private RX ring for tally DMA. LAN1 DHCP disabled. Physical acceptance pending.\n\n'
+                      + (root / 'firmware/rtl_nic/LICENSE').read_text())
+    manifest.update(lan1_tx_diagnostic=True, policy_sha256=sha256(policy),
+                    services=['wan-dhcp-client', 'wan-gateway-probes', 'lan1-tx-diagnostic'])
+if os.environ.get('R5S_B51_WAN_UDP') == '1':
+    manifest['wan_b51_udp_port'] = 48125
+    manifest['services'].append('wan-b51-status')
+    policy.write_text('WAN DHCP with on-link UDP B51 status at port 48125.\n' + policy.read_text())
+    manifest['policy_sha256'] = sha256(policy)
+stage = os.environ.get('R5S_DUAL_LAN_STAGE')
+if stage:
+    status_on = os.environ.get('R5S_LAN_B51_UDP') == '1'
+    stage_services = ['wan-dhcp-client','wan-gateway-probes'] + services(stage)
+    if not status_on:
+        stage_services = [name for name in stage_services if name != 'wan-b51-status']
+    manifest.update(lan_checkpoint=stage, lan_topology='shared-lan1',
+                    wan_b51_udp_port=48125 if status_on else 0,
+                    lan_status_version=3, lan_dns=dns_option(), wan_diag_fallback=fallback_option(),
+                    services=stage_services)
+    policy.write_text(f'LAN checkpoint {stage}. WAN DHCP and read-only UDP status. Physical acceptance pending.\n\n'
+                      + (root / 'firmware/rtl_nic/LICENSE').read_text())
+    manifest['policy_sha256'] = sha256(policy)
+    if os.environ.get('R5S_LAN_B51_UDP') == '1':
+        manifest['lan_b51_udp_port'] = 48125
+    if stage == 'dual-lan-router':
+        workers = schedule in WORKER_SCHEDULES
+        zero_copy = workers and options.get("R5S_ZERO_COPY") != "0"
+        manifest.update(lan_status_version=6 if zero_copy else 5 if workers else 4, router_schedule=schedule)
+        if zero_copy:
+            pool = zc_pool_manifest(options)
+            manifest.update(zc_enabled=True, zc_buffers=pool['size'] // 2048, zc_buffer_bytes=2048,
+                            zc_pool=pool,
+                            zc_meta_va=0x66800000, zc_links_va=0x66900000)
+        tx_ipv4 = [port for port in ('wan','lan1','lan2')
+                   if os.environ.get(f'R5S_{port.upper()}_TX_IPV4_CHECKSUM') == '1']
+        if tx_ipv4:
+            manifest['tx_ipv4_checksum_requested'] = tx_ipv4
+        tso = [port for port in ('wan','lan1','lan2')
+               if os.environ.get(f'R5S_{port.upper()}_TSO') == '1']
+        if tso:
+            manifest['tso_requested'] = tso
+            manifest['tso_ipv6'] = os.environ.get('R5S_TSO_IPV6') != '0'
+            if os.environ.get('R5S_TSO_TEST') == '1':
+                manifest['tso_test'] = True
+        if options:
+            manifest['optimization_options'] = options
+        manifest['wan_shutdown_driver_sha256'] = sha256(base / 'driver.elf')
+image = base / f'r5s-{profile}.img'
+assemble_files(image,uboot,[(payload,'loader.img'),(policy,'boot.txt')],manifest,sha256(payload)+sha256(uboot))
+trace.require(verify(image)==manifest,'LAN1 image verification failed')
+print(sha256(image))

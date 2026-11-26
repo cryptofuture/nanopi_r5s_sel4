@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+import shutil
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+from image import verify
+from policy import sha256
+
+root = Path(__file__).resolve().parents[1]
+base = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else root / 'out/router-wan-dhcp'
+gated = base.name == 'router-lan-nat'
+name = 'r5s-router.img' if gated else 'r5s-wan-dhcp.img'
+first, second = (base / f'build-{letter}' / name for letter in (sys.argv[2:] or ('c', 'd')))
+digest = sha256(first)
+if digest != sha256(second) or verify(first) != verify(second):
+    raise SystemExit('Independent builds differ')
+image = base / name
+if not image.exists():
+    with first.open('rb') as src, image.open('xb') as dst:
+        shutil.copyfileobj(src, dst)
+elif sha256(image) != digest:
+    raise SystemExit('Existing delivery image differs')
+(base / 'SHA256SUMS').write_text(f'{digest}  {name}\n')
+
+labels = [
+    'Boot reached the WAN SYS supervisor',
+    'PHY link pending or down',
+    'PHY negotiated a link',
+    'GMAC DMA and queues ready',
+    'DHCPDISCOVER submitted to the GMAC TX queue',
+    'Valid DHCPOFFER observed for the current discovery transaction',
+    'DHCPREQUEST submitted to the GMAC TX queue',
+    'DHCPACK accepted and address conflict check completed; lease bound',
+    'Fresh gateway ARP reply validated',
+    'Gateway ICMP Echo Reply validated for this lease',
+    '45 seconds since acquisition started without a bound lease',
+    '20 seconds since binding without a validated Echo Reply',
+]
+faults = {
+    0: 'Unclassified fatal failure', 1: 'Counter frequency', 2: 'Supervisor poll deadline',
+    3: 'Health service deadline', 4: 'Driver status or ABI',
+    5: 'PHY sample freshness', 6: 'Driver execution freshness',
+    7: 'WAN application status, queue fault or deadline', 8: 'Invalid timestamp', 9: 'Startup phase deadline',
+    40: 'Frame queue contract', 41: 'Register write guard', 59: 'Cache geometry', 60: 'CPU scratch readback',
+    61: 'Driver saw supervisor failure', 62: 'Driver initialization deadline',
+}
+faults.update(enumerate(['Link clock', 'MAC revision', 'Inactive MAC/DMA check', 'MDIO operation',
+                         'PHY identity or status', 'PHY reset deadline', 'Negotiated rate or duplex',
+                         'Platform readback', 'IO-domain guard', 'Driver counter frequency'], 17))
+faults.update(enumerate(['Cache maintenance', 'Pool or DMA start guard', 'MAC DMA feature fields',
+                         'DMA quiesce deadline', 'DMA channel fault', 'TX deadline',
+                         'Descriptor ownership or completion', 'TX packet length'], 32))
+faults.update({48 + i: f'Cache syscall result {i + 1}' for i in range(11)})
+
+def word(code):
+    bits = f'{code:07b}{code.bit_count() % 2}'.translate(str.maketrans('01', 'SL'))
+    return f'{bits[:4]} / {bits[4:]}'
+
+gap_reports = 'wan-stack-and-deadline-witness' in verify(first).get('corrections', [])
+if gap_reports:
+    for i, span in enumerate(('policy and reporting', 'GPIO update window', 'loop boundary and status reads')):
+        for offset, progress in ((0, 'unchanged'), (3, 'advanced')):
+            faults[101+i+offset] = f'Fault 2 detail: longest interval in {span}; independent health counter {progress}'
+    faults[107] = 'Fault 2 detail: non-monotonic counter within the sampled interval'
+wan_repair = 'rtl8211f-common-ability-and-dma-reset' in verify(first).get('corrections', [])
+if wan_repair:
+    faults.update(enumerate([
+        'Fatal: GMAC DMA software reset did not self-clear within 50 ms',
+        'TX descriptor submitted and its tail doorbell written',
+        'TX descriptor reclaimed without a completion error',
+        'RX descriptor delivered a validated-length frame',
+        'RX descriptor rejected on status, capacity or length',
+        'A descriptor carrying DHCPDISCOVER was successfully reclaimed',
+        'DHCPDISCOVER queued; no DISCOVER descriptor completion recorded for this DMA run',
+    ], 108))
+codes = faults | dict(enumerate(labels, 116))
+(base / 'fault-codes.md').write_text(
+    '# WAN SYS report words\n\n'
+    'Each report starts with the familiar rapid flutter and dark gap. '
+    'Read four symbols, a separator, then four symbols. S is 0.4 s ON and L is 2 s ON. '
+    'IDs 116-127 are milestone reports, including recoverable timeouts. '
+    'Progress reports rotate about every 42.5 seconds.\n\n'
+    + ('IDs 109-114 are data-path milestones during the current DMA run. Each word reflects its start-of-frame sample. A TX completion alone cannot establish wire delivery.\n\n' if wan_repair else '')
+    + ('Fault 2 alternates with one latched contextual word (101-107). This locates elapsed wall time, including preemption. Other fatal words repeat alone.\n\n' if gap_reports else 'A fatal code repeats alone.\n\n')
+    +
+    '| ID | Word | Meaning |\n|---:|---|---|\n'
+    + ''.join(f'| {code} | {word(code)} | {label} |\n' for code, label in sorted(codes.items()))
+)
+if gated:
+    if verify(first)['profile'] != 'router-lan-gated':
+        raise SystemExit('Gated target profile required')
+    with (base/'fault-codes.md').open('a') as table:
+        print("\n## Router reports\n",file=table)
+        print("A continuous five-second ON prefix replaces the flutter only for these words. Read the prefix before decoding. The symbol slots and parity stay the same. A partial frame is inconclusive.\n",file=table)
+        print("| Router word | Meaning |\n|---|---|",file=table)
+        for number,label in [(1,'Fresh router policy heartbeat. Both LAN DMA paths blocked by build policy.'),
+                             (2,'WAN case LED GPIO and mux setup passed readback.'),
+                             (3,'Router policy heartbeat missing, stale, or reporting queue/configuration failure at sampling time.'),
+                             (4,'RTL8211F jack LED control readback matched and page zero was restored.')]:
+            print(f'| {word(number)} | {label} |',file=table)
+        print("\nPCIe discovery, LAN link, LAN DMA, LAN leases and NAT forwarding have no reachable success word in this profile. Earlier discovery codes apply to their own image.",file=table)
+with tempfile.TemporaryDirectory(dir=base) as temp:
+    stage = Path(temp) / base.name
+    stage.mkdir()
+    docs = ['operator.md','fault-codes.md','test-results.md']
+    docs += ['implementation-report.md','network-architecture.md','dma-safety-report.md'] if gated else ['implementation-status.md']
+    for file in (image, *(base / name for name in docs)):
+        shutil.copyfile(file, stage / file.name)
+    if gated:
+        for path in ('wan-dhcp/system.system','wan-manifest.json','source-hashes.json','layout-report.json'):
+            shutil.copyfile(first.parent/path,stage/Path(path).name)
+    if wan_repair and not gated:
+        shutil.copyfile(base/'repair-report.md', stage/'repair-report.md')
+    shutil.copytree(root / 'protocol', stage / 'protocol')
+    scripts = stage / 'scripts'
+    scripts.mkdir()
+    for script in (root / 'scripts').iterdir():
+        if script.suffix == '.py' or script.name in ('flash-sd', 'verify-image'):
+            shutil.copyfile(script, scripts / script.name)
+    shutil.copyfile(root / 'scripts/check-router-deps', scripts / 'check-deps')
+    files = sorted(p for p in stage.rglob('*') if p.is_file())
+    (stage / 'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.relative_to(stage)}\n' for p in files))
+    archive = base / ('r5s-router-handoff.tar.gz' if gated else 'r5s-wan-dhcp-handoff.tar.gz')
+    with tarfile.open(archive, 'x:gz') as bundle:
+        bundle.add(stage, arcname=stage.name)
+    (base / (archive.name + '.sha256')).write_text(f'{sha256(archive)}  {archive.name}\n')

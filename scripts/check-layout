@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+import json
+from pathlib import Path
+import re
+import shutil
+import struct
+import sys
+from policy import check_layout, check_ram, elf_segments, sha256
+
+root = Path(__file__).resolve().parents[1]
+out = root / 'out'
+sdk = root / 'vendor/microkit/release/microkit-sdk-2.4.0/board/nanopi_r5s/debug'
+try:
+    memory = json.loads((sdk / 'platform_gen.json').read_text())['memory']
+    if memory != [dict(start=0x20000000, end=0x40000000)]:
+        raise ValueError('Kernel/SDK RAM differs from prototype policy')
+    reports = {}
+    for name in ('loader', 'sel4', 'monitor', 'initialiser'):
+        path = sdk / f'elf/{name}.elf'
+        entry, segments = elf_segments(path)
+        reports[name] = dict(entry=entry, segments=segments)
+        shutil.copy2(path, out / f'{name}.elf')
+    for segment in reports['sel4']['segments']:
+        check_ram((segment['physical'], segment['physical'] + segment['size']))
+    payload = out / 'loader.img'
+    data = payload.read_bytes()
+    magic = struct.pack('<Q', 0x5e14dead14de5ead)
+    positions = [m.start() for m in re.finditer(re.escape(magic), data)]
+    valid = []
+    for position in positions:
+        if position + 64 > len(data):
+            continue
+        header = struct.unpack_from('<8Q', data, position)
+        if header[1] == len(data) - position and 0 < header[7] < 100:
+            valid.append((position, header))
+    if len(valid) != 1:
+        raise ValueError('Missing or ambiguous genuine Microkit loader metadata')
+    position, header = valid[0]
+    entry, segments = elf_segments(out / 'loader.elf')
+    if entry != 0x30000000:
+        raise ValueError('Unexpected loader entry')
+    live_end = max(s['physical'] + s['size'] for s in segments)
+    input_end = max(0x30000000 + len(data), live_end)
+    check_ram((0x30000000, input_end))
+    regions = [('loader input, stack, page tables', 0x30000000, input_end)]
+    metadata_end = 64 + header[7] * 32
+    for i in range(header[7]):
+        address, size, offset, kind = struct.unpack_from('<4Q', data, position + 64 + 32 * i)
+        if (kind != 1 or not size
+                or position + metadata_end + offset + size > len(data)):
+            raise ValueError('Invalid loader output region')
+        check_ram((address, address + size))
+        regions.append((f'loader output {i}', address, address + size))
+    check_layout(regions)
+    objects = []
+    for line in (out / 'microkit-report.txt').read_text().splitlines():
+        match = re.search(r"@ 0x([0-9a-f]+)", line)
+        if match:
+            address = int(match[1], 16)
+            if address != 0xfe770000:
+                check_ram((address, address + 0x1000))
+            objects.append(dict(description=line.strip(), address=address))
+    if not objects:
+        raise ValueError('Missing physical allocation report')
+    # The binman map is authoritative for raw offsets within u-boot-rockchip.bin.
+    binmap = (out / 'uboot/simple-bin.map').read_text()
+    fit = re.search(r'^\s*([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s+fit\s*$', binmap, re.M)
+    if not fit or int(fit[1], 16) + 32768 != 0x800000:
+        raise ValueError('Unverified binman FIT offset')
+    uboot = out / 'u-boot-rockchip.bin'
+    if 32768 + uboot.stat().st_size > 0x1000000:
+        raise ValueError('Bootloader overlaps filesystem')
+    report = dict(loader_sha256=sha256(payload), uboot_sha256=sha256(uboot),
+                  sdk_memory=memory, elf=reports, loader_regions=regions,
+                  capdl_allocations=objects, binman_map=binmap,
+                  hardware_verified=False,
+                  limitations=['Full board DT reservation table unavailable',
+                               'Opaque DDR/BL31 firmware ownership and ABI require board test',
+                               'U-Boot live top-of-RAM guard is checked at hardware handoff'])
+    (out / 'layout-approved.json').write_text(json.dumps(report, indent=2) + '\n')
+    print('Static layout checks passed; hardware reservations remain unverified')
+except (ValueError, OSError, KeyError, struct.error) as error:
+    (out / 'layout-approved.json').unlink(missing_ok=True)
+    sys.exit(f'LAYOUT NOT APPROVED: {error}')

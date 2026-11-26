@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+import argparse
+import re
+
+SPANS = (
+    "policy/reporting", "GPIO window", "loop boundary", "GMAC status snapshot",
+    "WAN app status snapshot", "health sampling", "health sample to final poll",
+    "invalid timestamp ordering",
+)
+
+
+def decode(words):
+    ids = []
+    for word in words:
+        bits = word.replace(" ", "").replace("/", "").upper()
+        if not re.fullmatch(r"[SL]{8}", bits) or bits.count("L") % 2:
+            raise ValueError(f"Invalid SYS word or parity: {word}")
+        ids.append(int(bits.translate(str.maketrans("SL", "01")), 2) >> 1)
+    marker, timing, hi1, lo1, hi2, lo2 = ids
+    if marker != 100 or not all(low <= value <= high for value, (low, high) in zip(
+        ids[1:], [(32, 47), (48, 63), (64, 79), (80, 95), (112, 127)], strict=True
+    )):
+        raise ValueError("Expected the marker and five consecutive extended frames")
+    return (
+        SPANS[(timing - 32) & 7],
+        bool((timing - 32) & 8),
+        ((hi1 - 48) << 4) | (lo1 - 64),
+        ((hi2 - 80) << 4) | (lo2 - 112),
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Decode six consecutive three-second flutter frames")
+    parser.add_argument("words", nargs=6, metavar="WORD", help="Eight S/L symbols per quoted word")
+    args = parser.parse_args()
+    try:
+        span, changed, lan1, lan2 = decode(args.words)
+    except ValueError as error:
+        parser.error(str(error))
+    print(f"Longest wall-time span: {span}")
+    print(f"Health changed across poll bracket: {changed}")
+    print(f"Raw LAN1 phase: {lan1}")
+    print(f"Raw LAN2 phase: {lan2}")

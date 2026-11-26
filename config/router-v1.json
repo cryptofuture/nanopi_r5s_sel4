@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "wan": {"device": "gmac0", "mac": "02:52:35:53:00:01", "configuration": "dhcp"},
+  "lan1": {"device": "rtl8125-apb-fe260000", "mac": "02:52:35:53:00:02", "address": "10.44.1.1", "prefix": 24, "pool": [100, 199]},
+  "lan2": {"device": "rtl8125-apb-fe270000", "mac": "02:52:35:53:00:03", "address": "10.44.2.1", "prefix": 24, "pool": [100, 199]},
+  "dns_override": [],
+  "policy": "outbound-stateful-no-inter-lan",
+  "fragments": "drop-laboratory-only"
+}

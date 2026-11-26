@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import uuid
+from policy import sha256
+
+
+def command(*args):
+    return subprocess.check_output(args, text=True)
+
+
+def block_dependencies(major_minor, flat):
+    matches = [(n, p) for n, p in flat if n['maj:min'] == major_minor]
+    if not matches:
+        raise ValueError('Block backing device unresolved')
+    dependencies = set()
+    for node, parents in matches:
+        chain = [n for n, _ in flat if n['name'] in parents] + [node]
+        if any(n['type'] == 'loop' for n in chain) or not any(n['type'] == 'disk' for n in chain):
+            raise ValueError('Block backing dependency chain unresolved')
+        dependencies.update(n['maj:min'] for n in chain)
+    return dependencies
+
+
+def r5s_overlay_backing(root, flat):
+    model = Path('/sys/firmware/devicetree/base/model').read_bytes().rstrip(b'\0')
+    compatible = Path('/sys/firmware/devicetree/base/compatible').read_bytes().split(b'\0')
+    if (model != b'FriendlyElec NanoPi R5S'
+            or b'friendlyelec,nanopi-r5s' not in compatible
+            or b'rockchip,rk3568' not in compatible):
+        raise ValueError('Unsupported board identity')
+    if os.readlink('/proc/1/ns/mnt') != os.readlink('/proc/self/ns/mnt'):
+        raise ValueError('Overlay resolver requires the init mount namespace')
+    options = {}
+    for option in root.get('options', '').split(','):
+        key, separator, value = option.partition('=')
+        if key in ('lowerdir', 'upperdir', 'workdir'):
+            if key in options or not separator:
+                raise ValueError('Ambiguous overlay options')
+            options[key] = value
+    if options != dict(lowerdir='/root', upperdir='/data/root', workdir='/data/work'):
+        raise ValueError('Unsupported R5S early-boot overlay layout')
+    boot = {}
+    for token in shlex.split(Path('/proc/cmdline').read_text()):
+        key, separator, value = token.partition('=')
+        if key in ('root', 'data', 'storagemedia', 'androidboot.storagemedia'):
+            if key in boot or not separator or not value:
+                raise ValueError('Ambiguous boot arguments')
+            boot[key] = value
+    if (boot.get('storagemedia') != 'emmc' or
+            boot.get('androidboot.storagemedia', 'emmc') != 'emmc'):
+        raise ValueError('Overlay boot storage is not unambiguously eMMC')
+    backing = []
+    for role, number in (('root', 8), ('data', 9)):
+        name = boot.get(role, '')
+        match = re.fullmatch(r'/dev/(mmcblk[0-9]+)p' + str(number), name)
+        if not match:
+            raise ValueError(f'Missing or unsupported overlay {role} backing device')
+        device = Path(name).resolve(strict=True)
+        whole = match[1]
+        matches = [(n, p) for n, p in flat if n['name'] == str(device)]
+        if len(matches) != 1:
+            raise ValueError(f'Missing or ambiguous overlay {role} backing device')
+        node, parents = matches[0]
+        sysdev = Path('/sys/class/block') / device.name
+        parent = Path('/sys/class/block') / whole
+        st = device.stat()
+        identity = f'{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}'
+        if (not stat.S_ISBLK(st.st_mode) or node['type'] != 'part'
+                or parents != [f'/dev/{whole}'] or identity != node['maj:min']
+                or sysdev.joinpath('dev').read_text().strip() != identity
+                or sysdev.joinpath('partition').read_text().strip() != str(number)
+                or sysdev.resolve().parent != parent.resolve()
+                or parent.joinpath('device/type').read_text().strip() != 'MMC'):
+            raise ValueError(f'Inconsistent eMMC block identity for overlay {role}')
+        cid = parent.joinpath('device/cid').read_text().strip()
+        if not re.fullmatch('[0-9a-fA-F]{32}', cid):
+            raise ValueError('Unknown eMMC CID')
+        probe = {}
+        for line in command('blkid', '-p', '-o', 'export', str(device)).splitlines():
+            key, separator, value = line.partition('=')
+            if separator:
+                if key in probe:
+                    raise ValueError('Ambiguous filesystem probe')
+                probe[key] = value
+        parsed_uuid = uuid.UUID(probe.get('UUID', ''))
+        filesystem_uuid = str(parsed_uuid)
+        if (not parsed_uuid.int or probe.get('TYPE') != 'ext4' or node.get('fstype') != 'ext4'
+                or filesystem_uuid != node.get('uuid')
+                or sum(n.get('uuid') == filesystem_uuid for n, _ in flat) != 1
+                or not (Path('/sys/fs/ext4') / device.name).is_dir()):
+            raise ValueError(f'Inconsistent or inactive ext4 identity for overlay {role}')
+        backing.append(dict(role=role, device=str(device), whole=whole, cid=cid,
+                            major_minor=identity, uuid=filesystem_uuid,
+                            dependencies=sorted(block_dependencies(identity, flat))))
+    if (backing[0]['whole'] != backing[1]['whole'] or backing[0]['cid'] != backing[1]['cid']
+            or backing[0]['uuid'] == backing[1]['uuid']):
+        raise ValueError('Overlay backing devices do not identify distinct filesystems on one eMMC')
+    return backing
+
+
+def require_unused_target(metadata):
+    # A kernel claim also sees filesystems hidden by early-boot mount detachment.
+    fd = os.open(metadata['name'], os.O_RDONLY | os.O_EXCL | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISBLK(st.st_mode) or
+                f'{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}' != metadata['major_minor']):
+            raise ValueError('Exclusive probe opened a different block device')
+    finally:
+        os.close(fd)
+
+
+def inspect(device, image, profile, expected):
+    device = Path(device).resolve(strict=True)
+    if not stat.S_ISBLK(device.stat().st_mode):
+        raise ValueError('Target must be a whole block device')
+    info = json.loads(command('lsblk', '--json', '--bytes', '--paths',
+                             '--output', 'NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,RM,MAJ:MIN,MOUNTPOINTS,FSTYPE,UUID'))
+    flat = []
+
+    def walk(node, parents):
+        flat.append((node, parents))
+        for child in node.get('children', []):
+            walk(child, parents + [node['name']])
+
+    for node in info['blockdevices']:
+        walk(node, [])
+    matches = [(n, p) for n, p in flat if n['name'] == str(device)]
+    if len(matches) != 1:
+        raise ValueError('Unknown or ambiguous device topology')
+    node, parents = matches[0]
+    descendants = [n for n, p in flat if str(device) in p or n is node]
+    mounts = json.loads(command('findmnt', '--json', '--output',
+                                'TARGET,SOURCE,FSTYPE,MAJ:MIN,OPTIONS'))
+    mounted = []
+
+    def mountwalk(n):
+        mounted.append(n)
+        for child in n.get('children', []):
+            mountwalk(child)
+
+    for mount in mounts['filesystems']:
+        mountwalk(mount)
+    protected = {n['maj:min'] for n in descendants}
+    root = [n for n in mounted if n['target'] == '/']
+    if len(root) != 1:
+        raise ValueError('Root backing device unresolved')
+    overlays = [n for n in mounted if n.get('fstype') == 'overlay']
+    overlay_backing = None
+    if overlays:
+        if profile != 'r5s' or len(overlays) != 1 or overlays[0] is not root[0]:
+            raise ValueError('Overlay dependency chain unresolved; unsupported overlay mount')
+        overlay_backing = r5s_overlay_backing(root[0], flat)
+        root_dependencies = {mm for b in overlay_backing for mm in b['dependencies']}
+        whole = f"/dev/{overlay_backing[0]['whole']}"
+        allowed = {whole, str(device), whole + 'boot0', whole + 'boot1'}
+        for n, ancestry in flat:
+            if not n.get('size'):
+                continue
+            if (n['type'] == 'part' and ancestry and ancestry[-1] in (whole, str(device))):
+                continue
+            if n['type'] != 'disk' or n['name'] not in allowed:
+                raise ValueError('Unsupported active block topology for R5S hidden overlay')
+    else:
+        try:
+            root_dependencies = block_dependencies(root[0]['maj:min'], flat)
+        except ValueError as error:
+            raise ValueError(f'Root backing dependency chain unresolved: {error}') from error
+    if root_dependencies & protected:
+        raise ValueError('Target is mounted as a root or overlay backing dependency')
+
+    def dependencies(mount):
+        if overlay_backing and mount['maj:min'] == root[0]['maj:min']:
+            return root_dependencies
+        if mount.get('fstype') in ('tmpfs', 'ramfs'):
+            return set()
+        return block_dependencies(mount['maj:min'], flat)
+    for mount in mounted:
+        if mount['maj:min'] in protected:
+            raise ValueError('Target or descendant is mounted, including root/boot')
+    source_mount = json.loads(command('findmnt', '--json', '--target', str(image),
+                                     '--output', 'MAJ:MIN,FSTYPE'))['filesystems'][0]
+    if dependencies(source_mount) & protected:
+        raise ValueError('Source image is on target')
+    log_paths = []
+    for fd in (1, 2):
+        try:
+            name = os.readlink(f'/proc/self/fd/{fd}')
+            if name.startswith('/') and Path(name).is_file():
+                log_paths.append(Path(name))
+        except OSError:
+            pass
+    for path in (Path(__file__).resolve(), Path.cwd(), *log_paths):
+        backing = json.loads(command('findmnt', '--json', '--target', str(path),
+                                     '--output', 'MAJ:MIN,FSTYPE'))['filesystems'][0]
+        if dependencies(backing) & protected:
+            raise ValueError('Writer or working directory is on target')
+    swaps = command('swapon', '--show', '--noheadings', '--raw', '--output', 'NAME').splitlines()
+    for swap in swaps:
+        swap_path = Path(swap).resolve(strict=True)
+        if stat.S_ISBLK(swap_path.stat().st_mode):
+            swap_stat = swap_path.stat()
+            swap_mm = f'{os.major(swap_stat.st_rdev)}:{os.minor(swap_stat.st_rdev)}'
+            if block_dependencies(swap_mm, flat) & protected:
+                raise ValueError('Target contains active swap')
+        else:
+            swap_mount = json.loads(command('findmnt', '--json', '--target', str(swap_path),
+                                            '--output', 'MAJ:MIN,FSTYPE'))['filesystems'][0]
+            if dependencies(swap_mount) & protected:
+                raise ValueError('Target contains swapfile')
+    sysdev = Path('/sys/class/block') / device.name
+    card_type = (sysdev / 'device/type').read_text().strip() if (sysdev / 'device/type').exists() else None
+    serial = (node.get('serial') or '').strip()
+    model = (node.get('model') or '').strip()
+    if profile == 'r5s':
+        serial = (sysdev / 'device/cid').read_text().strip()
+        model = (sysdev / 'device/name').read_text().strip()
+    metadata = dict(name=str(device), kind=node['type'], size=int(node['size']),
+                    model=model, serial=serial, transport=node.get('tran'),
+                    card_type=card_type, parent=bool(parents),
+                    removable=node.get('rm'), major_minor=node['maj:min'])
+    validate(metadata, profile, expected, image.stat().st_size)
+    if overlay_backing:
+        require_unused_target(metadata)
+        metadata['overlay_backing'] = overlay_backing
+        metadata['overlay_target_check'] = 'kernel read-only exclusive claim succeeded'
+    return metadata
+
+
+def validate(meta, profile, expected, image_size):
+    if (meta['kind'] != 'disk' or meta['parent'] or meta['card_type'] == 'MMC'
+            or any(token in meta['name'] for token in ('boot', 'rpmb'))):
+        raise ValueError('Refusing eMMC, partition or auxiliary device')
+    if not meta['serial'] or not meta['model']:
+        raise ValueError('Unknown identity')
+    if (meta['serial'], meta['model'], meta['size']) != expected:
+        raise ValueError('Identity differs from explicit expectations')
+    if image_size <= 0 or meta['size'] < image_size:
+        raise ValueError('Invalid image or insufficient capacity')
+    if profile == 'r5s' and meta['card_type'] != 'SD':
+        raise ValueError('R5S target must have sysfs type SD')
+    if profile == 'usb' and (meta['transport'] != 'usb' or meta['card_type'] == 'MMC'):
+        raise ValueError('USB reader identity required')
+
+
+def main():
+    p = argparse.ArgumentParser(description='Guarded SD writer, dry-run by default')
+    p.add_argument('--device', required=True)
+    p.add_argument('--image', type=Path, required=True)
+    p.add_argument('--profile', choices=['r5s', 'usb'], required=True)
+    p.add_argument('--expect-serial', required=True,
+                   help='R5S: full 32-hex CID from device/cid, not the short device/serial')
+    p.add_argument('--expect-model', required=True)
+    p.add_argument('--expect-bytes', type=int, required=True)
+    p.add_argument('--execute', action='store_true')
+    args = p.parse_args()
+    image = args.image.resolve(strict=True)
+    digest = sha256(image)
+    expected = (args.expect_serial, args.expect_model, args.expect_bytes)
+    # Validate structure before any target is opened for writing.
+    subprocess.run([sys.executable, str(Path(__file__).with_name('verify-image')),
+                    str(image)], check=True)
+    before = inspect(args.device, image, args.profile, expected)
+    print(json.dumps(dict(mode='EXECUTE' if args.execute else 'DRY RUN', target=before,
+                          image=str(image)), indent=2))
+    if not args.execute:
+        return
+    confirmation = f"OVERWRITE {before['name']} {before['serial']} {before['size']}"
+    print('Back up and unmount the card first. Existing contents will be destroyed.')
+    if input(f'Type {confirmation!r}: ') != confirmation:
+        raise ValueError('Confirmation did not match')
+    with open(image, 'rb') as source:
+        if hashlib.file_digest(source, 'sha256').hexdigest() != digest:
+            raise ValueError('Source changed since validation')
+        source.seek(0)
+        fingerprint = (os.fstat(source.fileno()).st_ino, os.fstat(source.fileno()).st_size,
+                       os.fstat(source.fileno()).st_mtime_ns)
+        after = inspect(args.device, image, args.profile, expected)
+        if after != before:
+            raise ValueError('Device identity changed')
+        fd = os.open(before['name'], os.O_RDWR | os.O_EXCL | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'r+b', buffering=0) as target:
+            st = os.fstat(target.fileno())
+            if not stat.S_ISBLK(st.st_mode) or f'{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}' != before['major_minor']:
+                raise ValueError('Opened device differs from inspected target')
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                if target.write(block) != len(block):
+                    raise OSError('Short device write')
+            os.fsync(target.fileno())
+            fcntl.ioctl(target.fileno(), 0x1261)  # BLKFLSBUF forces device readback.
+            source.seek(0)
+            target.seek(0)
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                if target.read(len(block)) != block:
+                    raise OSError('Readback mismatch')
+            st = os.fstat(source.fileno())
+            if (st.st_ino, st.st_size, st.st_mtime_ns) != fingerprint:
+                raise ValueError('Source changed during write')
+    print('Written, flushed and byte-compared. No reboot requested.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        sys.exit(f'REFUSED: {error}')

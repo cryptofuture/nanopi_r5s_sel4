@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import shutil
+import tarfile
+import tempfile
+
+from image import verify
+from policy import sha256
+
+root = Path(__file__).resolve().parents[1]
+base = root / 'out/router-pcie-diagnostic'
+image = base / 'r5s-pcie-diagnostic.img'
+assert verify(image)['profile'] == 'pcie-diagnostic'
+assert sha256(image) == sha256(base / 'verified-b' / image.name)
+(base / 'SHA256SUMS').write_text(f'{sha256(image)}  {image.name}\n')
+errors = [
+    'Counter frequency or PPLL state', 'Clock gate/mux readback', 'PIPE power deadline',
+    'PIPE idle acknowledgment deadline', 'PERST, GPIO mux or reset readback',
+    'PHY readiness', 'Root configuration or link training', 'Configuration access or endpoint ID',
+    'BAR sizing, assignment or readback', 'Unsupported RTL8125 TxConfig', 'MMIO access',
+]
+codes = {
+    98: 'LAN1 result unavailable at startup deadline',
+    99: 'LAN2 result unavailable at startup deadline',
+}
+for i, error in enumerate(errors, 65):
+    for offset, owner in [(0, 'Shared provider'), (11, 'LAN1'), (22, 'LAN2')]:
+        codes[i + offset] = f'{owner}: {error}'
+for port in range(2):
+    for method, name in enumerate(('A48', 'A49', 'B50', 'B51')):
+        for enable in range(2):
+            code = 100 + 8 * port + 2 * method + enable
+            codes[code] = f'LAN{port+1} detected {name}; inbound region 0 enable bit {enable}'
+
+def optical(code):
+    bits = f'{code:07b}{code.bit_count() % 2}'.translate(str.maketrans('01', 'SL'))
+    return f'{bits[:4]} / {bits[4:]}'
+
+(base / 'fault-codes.md').write_text(
+    '# PCIe discovery reports\n\n'
+    'Slow square wave means discovery pending. Each report starts with the existing flutter '
+    'prefix and two groups of four short/long symbols. Short ON is 0.4 s; long ON is 2 s. '
+    'LAN1 reports twice, then LAN2 twice. A shared failure occupies both slots. '
+    'IDs 100–115 are observations, including the region 0 enable bit, '
+    'which by itself says nothing about DMA isolation.\n\n'
+    '| ID | SYS word | Meaning |\n|---:|---|---|\n'
+    + ''.join(f'| {code} | {optical(code)} | {label} |\n' for code, label in sorted(codes.items()))
+)
+(base / 'operator.md').write_text('''# NanoPi R5S PCIe discovery
+
+Hardware status is NOT TESTED. This image inspects direct RTL8125 endpoints. It does not run NIC DMA or route packets.
+
+Transfer both `r5s-pcie-diagnostic-handoff.tar.gz` and its `.sha256` file to `/root/r5s-flash/` on Ubuntu eMMC. Run the following as root. Stop if any command fails. The target must be unmounted. If `/mnt/r5s-boot` is mounted from the SD, unmount it normally first.
+
+```bash
+(
+set -eu
+cd /root/r5s-flash
+sha256sum -c r5s-pcie-diagnostic-handoff.tar.gz.sha256
+tar -tzf r5s-pcie-diagnostic-handoff.tar.gz
+test ! -e router-pcie-diagnostic
+tar -xzf r5s-pcie-diagnostic-handoff.tar.gz
+cd router-pcie-diagnostic
+sha256sum -c SHA256SUMS
+python3 scripts/check-deps
+python3 scripts/flash-sd --device /dev/mmcblk0 --image r5s-pcie-diagnostic.img --profile r5s --expect-model NCard --expect-serial 8903034e43617264100d3aa313016c07 --expect-bytes 62534975488
+)
+```
+
+Only after the dry run passes, use the separate guarded writer invocation. Confirm only if the displayed target identity matches. The writer flushes and verifies readback.
+
+```bash
+(
+set -eu
+cd /root/r5s-flash/router-pcie-diagnostic
+python3 scripts/flash-sd --device /dev/mmcblk0 --image r5s-pcie-diagnostic.img --profile r5s --expect-model NCard --expect-serial 8903034e43617264100d3aa313016c07 --expect-bytes 62534975488 --execute
+)
+```
+
+Confirm with `OVERWRITE /dev/mmcblk0 8903034e43617264100d3aa313016c07 62534975488`.
+
+Power down cleanly. Use the established SD boot selection, with both LANs disconnected from production networks. Observe SYS for roughly four minutes. Match two copies of each report using `fault-codes.md`. A detection report shows that the provider trained the link, identified the direct endpoint, sized and programmed BAR2, read TxConfig and checked that endpoint and root decoding were disabled after inspection. Region 0 is read only. It does not establish inbound reachability or isolation.
+
+Power off, remove SD, boot Ubuntu on eMMC and confirm ordinary access. If recovery fails, stop experiments. A stalled loader, kernel or supervisor can prevent optical reporting.
+''')
+with tempfile.TemporaryDirectory(dir=base) as temp:
+    stage = Path(temp) / base.name
+    stage.mkdir()
+    for path in (image, base / 'operator.md', base / 'fault-codes.md'):
+        shutil.copyfile(path, stage / path.name)
+    scripts = stage / 'scripts'
+    scripts.mkdir()
+    for script in (root / 'scripts').iterdir():
+        if script.suffix == '.py' or script.name in ('verify-image', 'flash-sd'):
+            shutil.copyfile(script, scripts / script.name)
+    shutil.copyfile(root / 'scripts/check-router-deps', scripts / 'check-deps')
+    files = sorted(p for p in stage.rglob('*') if p.is_file())
+    (stage / 'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.relative_to(stage)}\n' for p in files))
+    archive = base / 'r5s-pcie-diagnostic-handoff.tar.gz'
+    with tarfile.open(archive, 'x:gz') as bundle:
+        bundle.add(stage, arcname=stage.name)
+    (base / (archive.name + '.sha256')).write_text(f'{sha256(archive)}  {archive.name}\n')

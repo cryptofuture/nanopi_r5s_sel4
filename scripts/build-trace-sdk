@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parents[1]
+p = argparse.ArgumentParser()
+p.add_argument('work', type=Path)
+p.add_argument('--r5s-smp', action='store_true')
+p.add_argument('--config', choices=('debug', 'release', 'benchmark'), default='debug')
+args = p.parse_args()
+host_tool = os.environ.get('R5S_TRACE_SDK_HOST_TOOL')
+if host_tool:
+    host_tool = Path(host_tool).resolve(strict=True)
+    if not host_tool.is_file() or not os.access(host_tool, os.X_OK):
+        p.error('R5S_TRACE_SDK_HOST_TOOL must be an executable Microkit host tool')
+if args.r5s_smp:
+    remap = f'--remap-path-prefix={args.work}=/r5s-sdk'
+    sysroot = subprocess.check_output(['rustc', '--print', 'sysroot'], text=True).strip()
+    os.environ['RUSTFLAGS'] = f"{os.environ.get('RUSTFLAGS', '')} {remap} --remap-path-prefix={sysroot}=/rust-toolchain".strip()
+sys.path.insert(0, str(args.work / 'microkit'))
+os.chdir(args.work / 'microkit')
+import build_sdk as sdk
+sdk.SUPPORTED_BOARDS += (sdk.BoardInfo(
+    name='nanopi_r5s_trace', arch=sdk.KernelArch.AARCH64,
+    gcc_cpu='cortex-a55', loader_link_address=0x30000000,
+    kernel_options={'KernelPlatform': 'rk3568', 'KernelMaxNumNodes': 4 if args.r5s_smp else 1,
+                    **({'KernelNumDomains': 1,
+                        'CMAKE_C_FLAGS': f'-ffile-prefix-map={args.work}=.',
+                        'CMAKE_ASM_FLAGS': f'-ffile-prefix-map={args.work}=.'} if args.r5s_smp else {}),
+                    'KernelArmExportVCNTUser': True,
+                    'KernelCustomDTSOverlay': root / 'microkit/memory-overlay.dts'}),)
+sys.argv = [sys.argv[0], '--sel4', str(args.work / 'sel4'),
+            '--boards', 'nanopi_r5s_trace', '--configs', args.config,
+            '--skip-docs', '--skip-tar', '--tool-target-triple', 'x86_64-unknown-linux-gnu']
+if host_tool:
+    sys.argv.append('--skip-tool')
+# Microkit copies the host tool from its local Cargo target directory.
+os.environ.pop('CARGO_TARGET_DIR', None)
+sdk.main()
+if host_tool:
+    release, = Path('release').glob('microkit-sdk-*')
+    (release / 'bin').mkdir(exist_ok=True)
+    shutil.copy2(host_tool, release / 'bin/microkit')
+if args.r5s_smp:
+    initialiser, = Path('release').glob(f'microkit-sdk-*/board/nanopi_r5s_trace/{args.config}/elf/initialiser.elf')
+    # Microkit embeds the ELF header and needs the global patch symbols.
+    subprocess.run(['aarch64-none-elf-objcopy', '--strip-debug', '--discard-all', initialiser], check=True)

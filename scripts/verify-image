@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import json
+import sys
+from image import verify
+
+if len(sys.argv) != 2:
+    sys.exit('Usage: scripts/verify-image IMAGE.img')
+try:
+    print(json.dumps(dict(image_validated=True, manifest=verify(Path(sys.argv[1]))), indent=2))
+except (ValueError, OSError, KeyError) as error:
+    sys.exit(f'INVALID IMAGE: {error}')

@@ -1,0 +1,7 @@
+Built-in command: r5sboot. No boot.scr, distro scan, environment save or fallback.
+Only the SD controller at 0xfe2b0000, card type SD, GPT partition 1, FAT loader.img.
+Require EL2, exact compiled payload length and SHA-256 before entry at 0x30000000.
+One long SYS flash: U-Boot stage. Steady SYS: failure. Three short flashes: Rust PD.
+FIFO SD access; disable IDMAC and SD interrupts before cache/MMU handoff.
+No network, PCIe, USB, watchdog, eMMC, installer or update boot path.
+Hashes check integrity, not authenticated secure boot.

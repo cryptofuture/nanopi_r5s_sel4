@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+import runpy,shutil
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1];BASE=ROOT/'out/router'
+ns=runpy.run_path(str(ROOT/'scripts/build-gmac-rawio'));fn=ns['build_pd'];fn.__globals__['BASE']=BASE
+(BASE/'work').mkdir(parents=True,exist_ok=True)
+shutil.copyfile(ROOT/'out/native-net/aarch64-sel4.json',BASE/'aarch64-sel4.json')
+elf=fn('pds/wan_dhcp','wan-app',ROOT/'out/native-net/work/microkit/release/microkit-sdk-2.4.0',extra={'queue.rs':ROOT/'pds/gmac_dma/src/queue.rs','shared.rs':ROOT/'pds/gmac_probe/src/shared.rs'})
+shutil.copyfile(elf,BASE/'wan-app.elf')
+print(BASE/'wan-app.elf')

@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+import argparse
+import gzip
+from pathlib import Path
+import shutil
+import subprocess
+import tarfile
+import xml.etree.ElementTree as ET
+
+from image import verify
+from policy import sha256
+
+root = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description='Verify and package two independent builds per LAN variant')
+parser.add_argument('--profile', choices=('lan-dhcp-diagnostics-v2', 'rtl8125-lan-repair'),
+                    default='lan-dhcp-diagnostics-v2')
+profile = parser.parse_args().profile
+base = root / f'out/router-{profile}'
+image = f'r5s-{profile}.img'
+archive = base / f'r5s-{profile}-handoff.tar.gz'
+files = {}
+verification = []
+for variant, mode, owners in [
+    ('variant-wan', 'wan', ()), ('variant-lan1', 'lan1', ('lan1',)),
+    ('variant-lan2', 'lan2', ('lan2',)), ('.', 'both', ('lan1', 'lan2')),
+]:
+    first = base / f'a-{mode}'
+    second = base / f'b-{mode}'
+    digest = sha256(first / image)
+    if sha256(second / image) != digest:
+        raise SystemExit(f'Independent builds differ for {mode}')
+    subprocess.run(['cmp', first / image, second / image], check=True)
+    for build in (first, second):
+        manifest = verify(build / image)
+        if (manifest['profile'], manifest['fault_diagnostics'], manifest['lan_startup']) != (
+            profile, 2, mode
+        ):
+            raise SystemExit(f'Wrong image manifest in {build}')
+        sdf = ET.parse(build / 'system.system')
+        domains = {pd.get('name'): (pd.get('priority'), pd.get('budget'), pd.get('period'))
+                   for pd in sdf.findall('protection_domain')}
+        expected = {'heartbeat': ('110', '200', '1000'), 'gmac': ('105', '200', '1000'),
+                    'wan': ('104', '200', '1000'), 'health': ('100', '100', '1000')}
+        expected.update({owner: ('99' if owner == 'lan1' else '98', '50', '1000')
+                         for owner in owners})
+        channels = {
+            frozenset((end.get('pd'), end.get('id')) for end in channel)
+            for channel in sdf.findall('channel')
+        }
+        expected_channels = {
+            frozenset((('heartbeat', '0' if owner == 'lan1' else '1'), (owner, '0')))
+            for owner in owners
+        }
+        if domains != expected or channels != expected_channels or sdf.findall('.//irq'):
+            raise SystemExit(f'Wrong scheduling or notification layout in {build}')
+        verification.append(f'{build.name}: image and Microkit layout verified, SHA256 {digest}\n')
+    dest = base / variant
+    dest.mkdir(exist_ok=True)
+    for name in (image, 'system.system', 'microkit-report.txt', 'layout-report.json',
+                 f'{Path(image).stem}.manifest.json'):
+        shutil.copyfile(first / name, dest / name)
+        files[str((dest / name).relative_to(base))] = dest / name
+    verification.append(f'{mode}: independent images are byte-identical\n')
+
+images = base / 'IMAGE-SHA256SUMS'
+images.write_text(''.join(f'{sha256(path)}  {name}\n' for name, path in sorted(files.items())
+                          if name.endswith('.img')))
+(base / 'verification.txt').write_text(''.join(verification))
+for name in ('IMAGE-SHA256SUMS', 'verification.txt', 'operator.md', 'fault-codes.md',
+             'diagnostic-timing.md', 'source-changes.md', 'test-results.md',
+             'regressions.log', 'lan.log', 'integrated.log'):
+    files[name] = base / name
+integrated = Path((base / 'integrated.log').read_text().split('Logs: ')[-1].strip())
+for path in integrated.glob('*.log'):
+    files[f'logs/{path.name}'] = path
+for name in ('check-router-deps', 'flash-sd', 'verify-image', 'decode-wan-fault2',
+             'image.py', 'policy.py', 'diag_profile.py', 'trace_profile.py'):
+    files[f'scripts/{name}'] = root / 'scripts' / name
+for path in (root / 'firmware/rtl_nic').iterdir():
+    if path.is_file():
+        files[str(path.relative_to(root))] = path
+sums = base / 'SHA256SUMS'
+sums.write_text(''.join(f'{sha256(path)}  {name}\n' for name, path in sorted(files.items())))
+files[sums.name] = sums
+temporary = archive.with_suffix('.tmp')
+with temporary.open('wb') as raw, gzip.GzipFile(filename='', fileobj=raw, mode='wb', mtime=0) as stream:
+    with tarfile.open(fileobj=stream, mode='w') as bundle:
+        for name, path in sorted(files.items()):
+            info = bundle.gettarinfo(str(path), f'{base.name}/{name}')
+            info.uid = info.gid = info.mtime = 0
+            info.uname = info.gname = ''
+            with path.open('rb') as file:
+                bundle.addfile(info, file)
+temporary.replace(archive)
+(base / f'{archive.name}.sha256').write_text(f'{sha256(archive)}  {archive.name}\n')

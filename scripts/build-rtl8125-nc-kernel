@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Build the experimental RTL8125 mapping kernel in a fresh directory."""
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parents[1]
+dest = Path(sys.argv[1]).resolve()
+dest.mkdir(parents=True)
+sel4 = dest / 'sel4'
+shutil.copytree(root / 'out/native-net/work/sel4', sel4, ignore=shutil.ignore_patterns('.git'))
+with (root / 'patches/router/sel4-rtl8125-normal-nc.patch').open('rb') as patch:
+    subprocess.run(['patch', '--batch', '--fuzz=0', '-p1'], cwd=sel4, stdin=patch, check=True)
+
+sys.path.insert(0, str(root / 'vendor/microkit'))
+import build_sdk as sdk
+
+board = sdk.BoardInfo(
+    name='nanopi_r5s_trace', arch=sdk.KernelArch.AARCH64,
+    gcc_cpu='cortex-a55', loader_link_address=0x30000000,
+    kernel_options={'KernelPlatform': 'rk3568', 'KernelMaxNumNodes': 1,
+                    'KernelArmExportVCNTUser': True,
+                    'CMAKE_C_FLAGS': f'-ffile-prefix-map={dest}=.',
+                    'CMAKE_ASM_FLAGS': f'-ffile-prefix-map={dest}=.',
+                    'KernelCustomDTSOverlay': root / 'microkit/memory-overlay.dts'},
+)
+config = next(config for config in sdk.SUPPORTED_CONFIGS if config.name == 'debug')
+sdk_dir = dest / 'sdk'
+(sdk_dir / 'board' / board.name / config.name / 'elf').mkdir(parents=True)
+sdk.build_sel4(sel4, root / 'vendor/microkit/tool/microkit', sdk_dir, dest / 'build', board, config, llvm=False)

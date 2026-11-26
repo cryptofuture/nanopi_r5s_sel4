@@ -1,0 +1,23 @@
+--- dma.c
++++ dma.c
+@@ -31,8 +31,8 @@
+  case 0x1100:return value==(6u<<18);
+  case 0x1104:return value==(8u<<16) || value==((8u<<16)|1u);
+  case 0x1108:return value==((8u<<16)|(DMA_BUFFER<<1)) || value==((8u<<16)|(DMA_BUFFER<<1)|1u);
+- case 0x1114:return value==base;
+- case 0x111c:return value==base+DMA_RX_DESC;
++ case 0x1114:return value==0 || value==base;
++ case 0x111c:return value==0 || value==base+DMA_RX_DESC;
+  case 0x112c:case 0x1130:return value==DMA_SLOTS-1;
+  case 0x1120:return value>=base && value<base+DMA_RX_DESC && (value-base)%DMA_STRIDE==0;
+  case 0x1128:return value>=base+DMA_RX_DESC && value<base+2*DMA_RX_DESC && (value-base-DMA_RX_DESC)%DMA_STRIDE==0;
+@@ -83,6 +83,9 @@
+  if ((hw_read(0,0x1104)|hw_read(0,0x1108))&1) return -23;
+  start=hw_us();
+  while (hw_read(0,0x100c)&0xff00u) {if (hw_us()-start>100000) return -23;hw_progress();}
++ hw_write(0,0x1114,0);
++ hw_write(0,0x111c,0);
++ if (hw_read(0,0x1114) || hw_read(0,0x111c)) return -23;
+  running=0;pending=0;return 0;
+ }
+ int dma_prepare_link(unsigned speed,unsigned duplex) {

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+root=$PWD
+build=$(realpath "$1")
+dest="$build/mapping-check"
+mkdir "$dest"
+base="$root/out/native-net/work/microkit/release/microkit-sdk-2.4.0"
+board=nanopi_r5s_trace
+config=debug
+cp -a "$base" "$dest/sdk"
+aarch64-none-elf-objcopy --strip-debug "$build/sdk/board/$board/$config/elf/sel4.elf" \
+    "$dest/sdk/board/$board/$config/elf/sel4.elf"
+cp "$root/out/network-dma-restart/rawio/gmac-rawio/health.elf" "$dest/"
+cat > "$dest/system.system" <<'XML'
+<system>
+    <memory_region name="lan1_dma" size="0x100000" phys_addr="0x24200000" />
+    <memory_region name="lan2_dma" size="0x100000" phys_addr="0x24300000" />
+    <protection_domain name="lan1_mapping_check" priority="100">
+        <program_image path="health.elf" />
+        <map mr="lan1_dma" vaddr="0x62000000" perms="rw" cached="false" />
+    </protection_domain>
+    <protection_domain name="lan2_mapping_check" priority="100">
+        <program_image path="health.elf" />
+        <map mr="lan2_dma" vaddr="0x62000000" perms="rw" cached="false" />
+    </protection_domain>
+</system>
+XML
+"$dest/sdk/bin/microkit" "$dest/system.system" --board "$board" --config "$config" \
+    --search-path "$dest" -r "$dest/capdl-report.txt" -o "$dest/loader-for-layout-check.bin"
+python3 - "$dest/capdl-report.txt" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+report = Path(sys.argv[1]).read_text()
+allocated = {}
+for name, address in re.findall(r"'([^']+)' @ (0x[0-9a-f]+)", report):
+    address = int(address, 16)
+    if 0x24200000 <= address < 0x24400000:
+        if address in allocated:
+            raise SystemExit(f'duplicate allocation at {address:#x}')
+        allocated[address] = name
+for lan, start in enumerate((0x24200000, 0x24300000), 1):
+    for i in range(256):
+        address = start + i * 4096
+        if allocated.pop(address, None) != f'frame_mr_lan{lan}_dma_{i:09d}':
+            raise SystemExit(f'LAN{lan} missing its private frame at {address:#x}')
+if allocated:
+    raise SystemExit('unexpected allocation in RTL8125 DMA memory')
+print('PASS: 512 fixed frames allocated exclusively to the two RTL8125 pools')
+PY

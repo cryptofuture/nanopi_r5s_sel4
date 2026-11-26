@@ -1,0 +1,14 @@
+#!/bin/bash
+set -eu
+cd "$(dirname "$0")/.."
+. scripts/env
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+for hash in 0 1; do
+    bridge=$((1 - hash))
+    R5S_NAT_HASH=$hash R5S_BRIDGE_LOCAL_HASH=$bridge rustc --edition 2024 -O --crate-type rlib --crate-name r5s_router_core \
+        --cfg 'feature="shared-nat"' router-core/src/lib.rs -o "$work/libr5s_router_core.rlib"
+    rustc --edition 2024 -O tests/datapath_benchmark.rs \
+        --extern r5s_router_core="$work/libr5s_router_core.rlib" -o "$work/benchmark"
+    "$work/benchmark" "$hash" "$bridge" "${R5S_NAT_PAIR_LOOKUP:-1}"
+done

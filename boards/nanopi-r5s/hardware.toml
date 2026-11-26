@@ -1,0 +1,16 @@
+model = "NanoPi R5S 4GB"
+soc = "RK3568B2"
+cores = 1
+psci = "smc"
+gic_distributor = 0xfd400000
+gic_redistributor = 0xfd460000
+uart = 0xfe660000
+gpio = 0xfe770000
+sys_pin = 26
+active_high = true
+sd = 0xfe2b0000
+emmc_forbidden = 0xfe310000
+prototype_ram_start = 0x20000000
+prototype_ram_end = 0x40000000
+loader_address = 0x30000000
+hardware_tested = false

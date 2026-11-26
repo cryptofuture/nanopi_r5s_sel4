@@ -1,0 +1,49 @@
+# R5S GMAC evidence and native link audit
+
+The outer archive `r5s-gmac-evidence.tar.gz` has SHA-256 `1e089e3a48580a08a28b0748b882352eee36a83e9dd0fa6a0e4c317e48c5cd3a`. It contains `evidence/` and the regular extensionless file `evidence/r5s-gmac0`, which is itself a gzip tar. Both layers were hashed and imported without executing their contents. All members were checked before extraction; links, special files, absolute paths, traversal, duplicates and file-as-directory collisions are rejected. New evidence is under `evidence/gmac-captured-1e089e3a/`, not over earlier evidence. The nested archive has 7,389 members. Its supplied file checksums all match. `out/gmac-bringup/evidence-index.json` records both archive layers, every path/size/hash, errors and omissions. No explicit collector version was embedded. The captured metadata agrees with the existing collector schema; that does not establish the exact collector source revision.
+
+The original exported FDT is present, 180,864 bytes. The reconstructed FDT is separately present, 177,599 bytes. The audit uses the original, preserves both and does not substitute reconstructed reservations. Captured dtc returned 0 but emitted a large warning log, retained in the archive. Empty driver fields are unknown, not proof of absent firmware or buses. `/proc/iomem` is retained but is not a list of all future experimental U-Boot allocations.
+
+## Captured facts and interpretations
+
+All member names below are relative to the inner `gmac-evidence/` directory. Detailed decoded properties, references, provider arguments, pin configuration and the field ledger are in `gmac0-resolved.json`.
+
+| Item | Captured location/value | Native interpretation or choice |
+|---|---|---|
+| Board | `runtime-original.dtb`, `/model`: FriendlyElec NanoPi R5S; compatibles friendlyelec,nanopi-r5s and rockchip,rk3568 | Both checked, no shortened-model substitution |
+| Kernel/driver | `driver.txt`: st_gmac, version 6.1.141 | Driver-reported kernel version; no uname output was collected |
+| Interface identity | `metadata.json` eth0 of_node and driver links; `/aliases/ethernet0` | Both resolve to `/ethernet@fe2a0000`, platform rk_gmac-dwmac |
+| MMIO/IP declaration | MAC `reg`: 0xfe2a0000, 0x10000; compatibles rk3568-gmac, dwmac-4.20a | Link PD maps only first 8 KiB needed for common MAC/MDIO and DMA-inactive checks |
+| Actual IP revision | No register dump in archive | Native code reads MAC_VERSION at 0x110, records full value, admits named common-register revisions 0x40/0x41/0x50/0x51/0x52; unknown revision faults. DT compatibility is not substituted for the runtime ID |
+| Interrupts | MAC `interrupts`: SPI 27 and SPI 24, level high | seL4 SPI IDs 59 and 56, not Linux IRQ numbers; neither is allocated or enabled |
+| PHY association | MAC phy-handle resolves to `/ethernet@fe2a0000/mdio/phy@1`; sysfs stmmac-0:01 matches | MDIO address 1 is resolved from this MAC, not another bus |
+| PHY identity | `mdio/stmmac-0:01-phy_id`: 0x001cc916; uevent driver RTL8211F Gigabit Ethernet | Expected ID generated from the capture, then checked by fresh native reads of registers 2/3; wrong/floating ID faults |
+| Captured link | `link.txt`: PHYAD 1, 1000 Mb/s, full duplex, autoneg on, link yes | Linux link evidence only, not native link or packet proof |
+| Interface/delays | MAC phy-mode rgmii, tx_delay 0x3c, rx_delay 0x2f | GRF GMAC0 CON0 0x380 programs captured values; CON1 0x384 selects RGMII and enables both MAC delays. PHY page 0xd08 TX bit 8 and RX bit 3 are cleared to avoid duplicate delays |
+| PHY hardware reset | MAC snps,reset-gpio resolves GPIO0 at 0xfdd60000, pin 21, active low; delays 0/15000/50000 us | Native GPIO-v2 version check before masked output/direction, PMUGRF mux to GPIO0_C5; assert low 15 ms, release high, wait 50 ms; timings nominal |
+| Clock direction | MAC clock_in_out output | CRU CLKSEL31 uses internal MAC0_2TOP and RGMII speed mux, no external-clock assumption |
+| Assigned clocks | RX/TX parent RGMII_SPEED; SCLK_GMAC0 parent CLK_MAC0_2TOP, 125,000,000 Hz | Read CPLL mode/dividers and existing CPLL_125M divider; require actual computed 125 MHz. Enable only necessary gates; never retune a PLL or shared divider. MDIO CSR range code 1 follows pinned Rockchip 100-150 MHz selection |
+| Clock/reset provider | CRU 0xfdd20000, clock/reset cells 1; reset ID 215 | SOFTRST13 bit 7 only. Assert GMAC reset BEFORE ungating its clocks, hold through setup, verify and release; no inherited active engine allowed to resume |
+| RGMII pinctrl | Captured gmac0 groups, GPIO2 pins 3,4,5,6,7,8,11,12,13,14,15,16,19,20 with captured muxes, pull-none and specified drive levels | Generated masked writes, including the pinned driver's complete GPIO2B0 split drive field. No other bank's mux/drive or voltage selector is written |
+| PMUGRF and GPIO clock | `/pinctrl/rockchip,pmu` resolves 0xfdc20000; PMUCRU 0xfdd00000 | Only reset-pin mux/pull and GPIO0 clock gate change |
+| IO domains | PMUGRF io-domains is enabled; supplies resolve to regulator nodes | This differs from the disabled *main GRF* io-domain node. Native code checks fixed PMUIO2/VCCIO1=3.3 V and VCCIO4/VCCIO6=1.8 V selector pairs before writes. It never changes voltage selectors or regulator rails. Unexpected firmware selector state faults before pinmux/clock writes |
+| PHY supply | No phy-supply on captured MAC/PHY | Do not invent a regulator association. Always/boot-on regulators are decoded; fresh native PHY ID/reset/read completion is mandatory. If firmware has not powered the PHY, initialization fails rather than becoming READY |
+| DMA properties | No dma-ranges, dma-coherent or iommus on this root-level MAC path | Absence is not a DMA coherency/containment proof. No native DMA pool or active rings in link profile |
+
+The physical target is the sole integrated 1 GbE RJ45 corresponding to eth0, not either 2.5 GbE RTL8125 jack. The captured tree/sysfs identifies the controller, not a chassis position or LAN/WAN label. Use the board's [official R5S documentation](https://wiki.friendlyelec.com/wiki/index.php/NanoPi_R5S) and physical 1 GbE identification; no unverified left/right position is asserted here.
+
+## Native code and limits
+
+`drivers/gmac0/link.c` is original native glue using the existing bounded MDIO core. Its register facts/sequences are audited against locked U-Boot commit 127a42c7257a6ffbbd1575ed1cbaa8f5408a44b3: Rockchip EQoS, CRU PLL/rate definitions, RK3568 pinctrl/IO-domain and RTL8211F code. `generate-gmac-config` binds GPIO, pins and delays to decoded capture values and refuses changed unsupported providers. Sources, hashes and reference licenses are retained in `gmac-sources.lock` and `references/`. Linux v6.1 common/hwif register references are pinned separately for interpretation, not introduced as a runtime kernel dependency. The prior v6.12 clock-reference file remains an interpretation reference, not board evidence or a kernel upgrade. No U-Boot network service or Linux datapath runs in this image.
+
+Hardware initialization checks fixed IO selectors and clock preconditions; asserts only GMAC0 reset; enables necessary parent/peripheral gates; sets captured mux, pull, explicit drive and RGMII delay fields; verifies masked readback; releases reset; validates MAC version; requires inactive MAC/DMA and zero descriptor bases; resets and identifies the PHY; waits for bounded software reset; removes PHY delays; disables EEE advertisement; advertises 10/100 half/full and 1000 full without pause/offloads; restarts autonegotiation. Unsupported version, failed write/readback, wrong PHY or MDIO/reset timeout is terminal. Missing cable is not an error. Reported initialization/poll failures reassert the claimed GMAC reset; failed initial clock/IO preconditions make no hardware writes.
+
+Fresh link polling revalidates the captured PHY ID, rejects invalid all-zero/all-one status, double-reads latched BMSR, requires link and autoneg completion, then reads RTL8211F page 0xa43 register 0x1a for link/speed/duplex and restores page 0. Invalid speed or 1000 half duplex faults. Negotiated clock/MAC speed is updated with RE/TE remaining zero. Polling repeats across cable removal/reconnect without reboot or a negotiation busy-loop.
+
+Every MMIO write passes a profile-specific whitelist. The link backend cannot write descriptor bases/tails, set DMA ST/SR, or set MAC RE/TE. It does not link ring functions, allocate DMA buffers or grant OWN bits. Every link poll rechecks start bits and all four descriptor-base words. The driver owns broad 4 KiB provider frames because hardware capabilities are page-granular; it is trusted. The whitelist reduces accidental programming mistakes, not authority available to a malicious driver. PCIe, GMAC1, eMMC, USB and watchdogs are not initialized by this component.
+
+## Memory reconciliation
+
+Root address/size cells are 2/2. Nonzero memory ranges exactly match the prior three captured ranges. Original FDT reservations are [0x08300000,0x0832c000) and [0x0a200000,0x0a9fdbc0). Nonzero reserved-memory entries are ramoops [0x00110000,0x00200000) and inactive reusable Linux CMA [0x10000000,0x10800000); zero-sized DRM entries are recorded as declarations but allocate no interval. Earlier low-memory, OP-TEE gap and peripheral exclusions remain. None intersects working RAM [0x20000000,0x40000000).
+
+`layout-report.json` checks real loader input/code/BSS/stack/page tables and copy destinations, kernel ELF, initialiser/monitor and CapDL physical objects against working RAM. Each of the seven new MMIO frames and the existing GPIO4 frame has one physical allocation. Shared status has one frame, with separate caps. Live relocated U-Boot code/stack/heap/DTB still use the existing runtime overlap guards; captured Linux reservations cannot replace those guards. No DMA RAM is allocated. This is source/static validation, not a physical bus-access or memory-isolation test.

@@ -1,0 +1,36 @@
+{
+  "status": "UNQUALIFIED: no native MAC writes permitted",
+  "base": 4264165376,
+  "register_size": 65536,
+  "measured_interface": "eth0",
+  "reference_only": {
+    "phy_address": 1,
+    "phy_mode": "rgmii",
+    "tx_delay": 60,
+    "rx_delay": 47,
+    "reset_gpio": "GPIO0_C5 active low",
+    "reset_delays_us": [
+      0,
+      15000,
+      50000
+    ],
+    "clock_direction": "output",
+    "reference_rate": 125000000
+  },
+  "missing": [
+    "complete runtime FDT and original reservation map if exported",
+    "resolved clock/reset/pinctrl/supply/delay configuration from captured full tree",
+    "actual MDIO PHY ID/revision",
+    "native DMA bus translation/address-width/coherency qualification",
+    "Normal-memory DMA mapping/cache-maintenance implementation",
+    "native driver integration and RX/TX implementation"
+  ],
+  "source_hashes": {
+    "vendor/u-boot/dts/upstream/src/arm64/rockchip/rk3568-nanopi-r5s.dts": "58257592073fe643fa16a9b9b46134635dd59271f8606061c1e62fb8b9355506",
+    "vendor/u-boot/dts/upstream/src/arm64/rockchip/rk3568.dtsi": "18fb4da557f3d02aacdbf42d6f9227a50455bbe73831e6051ba8899523b1cf66",
+    "vendor/u-boot/drivers/net/dwc_eth_qos.h": "f46a1cb92ddbbe6c37b2cc932dff9edc3c95debc7588fda89fe50a4d4306fc7e",
+    "vendor/u-boot/drivers/net/dwc_eth_qos.c": "d89f03e4a61d6f639430754ac08b37d002800315d311deae7f7ad17f29cb23ce",
+    "vendor/u-boot/drivers/net/dwc_eth_qos_rockchip.c": "1e5a318ab58ef301626cc3f39347b7d9f90d2b12ec6196c767a0aedf64df7e56",
+    "vendor/sel4/src/arch/arm/64/kernel/vspace.c": "499e747f63aaf8c122bbb5de4596163e1d36f87b1d540d90c996a5cba23fc1ae"
+  }
+}

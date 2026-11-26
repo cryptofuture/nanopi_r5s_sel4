@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Compile the native provider PD for the pinned SDK without assembling an image."""
+from pathlib import Path
+import runpy
+import shutil
+import tempfile
+
+root = Path(__file__).resolve().parents[1]
+build = runpy.run_path(str(root / 'scripts/build-rawio-dma-restart'))['build_pd']
+output = root / 'out/router-integrated'
+output.mkdir(parents=True, exist_ok=True)
+base = Path(tempfile.mkdtemp(prefix='pcie-provider-', dir=output))
+build.__globals__['BASE'] = base
+(base / 'logs').mkdir(exist_ok=True, parents=True)
+shutil.copyfile(root / 'out/network-dma-restart/rawio/aarch64-sel4.json', base / 'aarch64-sel4.json')
+sdk = root / 'out/native-net/work/microkit/release/microkit-sdk-2.4.0'
+modules = ['mmio', 'pcie', 'mac', 'dma', 'phy', 'platform', 'provider', 'ring']
+elf = build('pds/pcie_provider', 'pcie-provider', sdk, extra={
+    f'{module}.rs': root / f'drivers/rtl8125/{module}.rs' for module in modules
+})
+shutil.copyfile(elf, base / 'pcie-provider.elf')
+print(base / 'pcie-provider.elf')

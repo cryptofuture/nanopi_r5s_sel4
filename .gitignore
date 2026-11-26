@@ -1,0 +1,7 @@
+/vendor/
+/tools/
+/out/
+**/__pycache__/
+/pds/heartbeat/target/
+core.*
+.mimocode/*
