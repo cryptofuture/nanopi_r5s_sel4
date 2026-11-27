@@ -5,3 +5,5 @@
 /pds/heartbeat/target/
 core.*
 .mimocode/*
+/front/node_modules/
+/front/dist/

@@ -1,0 +1,17 @@
+@import 'tailwindcss';
+
+html {
+  -webkit-font-smoothing: antialiased;
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
+  font-synthesis-weight: none;
+}
+
+code,
+pre,
+.font-mono-plex {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+}
