@@ -1469,6 +1469,22 @@ const isPageVisible = () => !document.hidden
 // The server has no tab to hide, so it renders as shown
 const isPageVisibleOnServer = () => true
 
+// Phones drop the animated visual: its SMIL beads and floating SVG stack are slow
+// on mobile. Tied to the md breakpoint where the stage cards take over from it.
+const MOBILE_QUERY = '(max-width: 767px)'
+
+const subscribeToMobile = (onChange) => {
+  const mq = window.matchMedia(MOBILE_QUERY)
+  mq.addEventListener('change', onChange)
+
+  return () => mq.removeEventListener('change', onChange)
+}
+
+const isMobileNow = () => window.matchMedia(MOBILE_QUERY).matches
+
+// The server cannot see the viewport; prerender keeps the visual and CSS hides it on phones
+const isMobileOnServer = () => false
+
 // Each layer slides against the pointer by a different amount, which is what reads as depth.
 const ParallaxLayer = ({ x, y, reach, children }) => {
   const tx = useTransform(x, (v) => v * reach)
@@ -1500,6 +1516,7 @@ const CoreVisual = () => {
   const visualRef = useRef(null)
 
   const reduce = useReducedMotion() ?? false
+  const mobile = useSyncExternalStore(subscribeToMobile, isMobileNow, isMobileOnServer)
 
   // The margin covers the outer orbit and its beads running a little past the visual's box
   const onScreen = useInView(visualRef, { initial: true, margin: '40px' })
@@ -1575,89 +1592,92 @@ const CoreVisual = () => {
   return (
     <LazyMotion features={domAnimation}>
       <>
-        {/* Fades and scales in with CSS (n3-enter), from the first paint rather than after hydration. */}
-        <div
-          ref={visualRef}
-          onPointerMove={handlePointerMove}
-          onPointerLeave={handlePointerLeave}
-          className='n3-enter @container relative -my-[6%] -ml-[12.5%] aspect-square w-[125%] max-w-none md:mx-auto md:my-0 md:w-full md:max-w-[840px] lg:mx-0 lg:w-[104%] lg:max-w-none'
-        >
-          <div className='absolute inset-0'>
-            <div aria-hidden className='n3-halo pointer-events-none absolute inset-[6%]' />
+        {/* Fades and scales in with CSS (n3-enter), from the first paint rather than after
+            hydration. Hidden below md and not mounted on phones (see MOBILE_QUERY). */}
+        {!mobile && (
+          <div
+            ref={visualRef}
+            onPointerMove={handlePointerMove}
+            onPointerLeave={handlePointerLeave}
+            className='hidden md:block n3-enter @container relative -my-[6%] -ml-[12.5%] aspect-square w-[125%] max-w-none md:mx-auto md:my-0 md:w-full md:max-w-[840px] lg:mx-0 lg:w-[104%] lg:max-w-none'
+          >
+            <div className='absolute inset-0'>
+              <div aria-hidden className='n3-halo pointer-events-none absolute inset-[6%]' />
 
-            <div className='n3-fade-edge absolute inset-0'>
-              <ParallaxLayer x={x} y={y} reach={-MOTION.backdropParallax}>
-                <SyntraDepthBackdrop className='absolute inset-0 size-full overflow-visible' />
-                <SyntraTechnicalBackdrop className='absolute inset-0 size-full overflow-visible' />
+              <div className='n3-fade-edge absolute inset-0'>
+                <ParallaxLayer x={x} y={y} reach={-MOTION.backdropParallax}>
+                  <SyntraDepthBackdrop className='absolute inset-0 size-full overflow-visible' />
+                  <SyntraTechnicalBackdrop className='absolute inset-0 size-full overflow-visible' />
+                </ParallaxLayer>
+              </div>
+
+              {/* The orbits sit outside the faded layer: the outer ring runs past the visual's box. */}
+              <ParallaxLayer x={x} y={y} reach={MOTION.ringParallax}>
+                <m.div style={{ opacity: orbitOpacity }} className='absolute inset-0'>
+                  <SyntraOrbitalSystem className='absolute inset-0 size-full overflow-visible' />
+                  <SyntraParticles
+                    half='back'
+                    animate={!reduce}
+                    paused={beadsPaused}
+                    className='absolute inset-0 size-full overflow-visible'
+                  />
+                </m.div>
               </ParallaxLayer>
+
+              <m.div style={{ opacity: shadowOpacity }} className='absolute inset-0'>
+                <SyntraCoreShadow className='pointer-events-none absolute inset-0 size-full overflow-visible' />
+              </m.div>
+
+              <Tilted rotateX={rotateX} rotateY={rotateY}>
+                <m.div style={{ opacity: restOpacity }} className='absolute inset-0'>
+                  <SyntraCoreObject className='absolute inset-0 size-full overflow-visible' />
+                </m.div>
+                <m.div style={{ opacity: explodedOpacity }} className='absolute inset-0'>
+                  <SyntraExplodedCore progress={progress} className='absolute inset-0 size-full overflow-visible' />
+                </m.div>
+                <StageConnectors progress={progress} active={open && !reduce} hovered={hovered} />
+              </Tilted>
+
+              <ParallaxLayer x={x} y={y} reach={MOTION.ringParallax}>
+                <m.div style={{ opacity: orbitOpacity }} className='absolute inset-0'>
+                  <SyntraParticles
+                    half='front'
+                    animate={!reduce}
+                    paused={beadsPaused}
+                    className='absolute inset-0 size-full overflow-visible'
+                  />
+                </m.div>
+              </ParallaxLayer>
+
+              {/* The cards ride the same tilt and float in a layer of their own, above the front orbit. */}
+              <Tilted rotateX={rotateX} rotateY={rotateY}>
+                <StageCards progress={progress} open={open} hovered={hovered} onHover={handleCardHover} />
+              </Tilted>
             </div>
 
-            {/* The orbits sit outside the faded layer: the outer ring runs past the visual's box. */}
-            <ParallaxLayer x={x} y={y} reach={MOTION.ringParallax}>
-              <m.div style={{ opacity: orbitOpacity }} className='absolute inset-0'>
-                <SyntraOrbitalSystem className='absolute inset-0 size-full overflow-visible' />
-                <SyntraParticles
-                  half='back'
-                  animate={!reduce}
-                  paused={beadsPaused}
-                  className='absolute inset-0 size-full overflow-visible'
-                />
-              </m.div>
-            </ParallaxLayer>
+            {/* A quiet invitation under the core. Touch screens have no hover, so they are told to tap. */}
+            <m.p
+              aria-hidden
+              style={{ opacity: hintOpacity }}
+              className='text-(color:--color-n3-grey) pointer-events-none absolute top-[84%] left-1/2 m-0 flex -translate-x-1/2 items-center gap-1.5 text-[12.5px] whitespace-nowrap'
+            >
+              <MousePointer2 className='text-(color:--color-n3-accent) size-3.5' strokeWidth={1.8} />
+              <span className='[@media(hover:none)]:hidden'>Hover to see the packet path</span>
+              <span className='hidden [@media(hover:none)]:inline'>Tap to see the packet path</span>
+            </m.p>
 
-            <m.div style={{ opacity: shadowOpacity }} className='absolute inset-0'>
-              <SyntraCoreShadow className='pointer-events-none absolute inset-0 size-full overflow-visible' />
-            </m.div>
-
-            <Tilted rotateX={rotateX} rotateY={rotateY}>
-              <m.div style={{ opacity: restOpacity }} className='absolute inset-0'>
-                <SyntraCoreObject className='absolute inset-0 size-full overflow-visible' />
-              </m.div>
-              <m.div style={{ opacity: explodedOpacity }} className='absolute inset-0'>
-                <SyntraExplodedCore progress={progress} className='absolute inset-0 size-full overflow-visible' />
-              </m.div>
-              <StageConnectors progress={progress} active={open && !reduce} hovered={hovered} />
-            </Tilted>
-
-            <ParallaxLayer x={x} y={y} reach={MOTION.ringParallax}>
-              <m.div style={{ opacity: orbitOpacity }} className='absolute inset-0'>
-                <SyntraParticles
-                  half='front'
-                  animate={!reduce}
-                  paused={beadsPaused}
-                  className='absolute inset-0 size-full overflow-visible'
-                />
-              </m.div>
-            </ParallaxLayer>
-
-            {/* The cards ride the same tilt and float in a layer of their own, above the front orbit. */}
-            <Tilted rotateX={rotateX} rotateY={rotateY}>
-              <StageCards progress={progress} open={open} hovered={hovered} onHover={handleCardHover} />
-            </Tilted>
+            <button
+              type='button'
+              aria-expanded={open}
+              aria-label='Show how the router moves a packet'
+              onPointerDown={handleCorePointerDown}
+              onPointerEnter={handleCorePointerEnter}
+              onClick={handleCoreClick}
+              onBlur={handleCoreBlur}
+              className='focus-visible:outline-(color:--color-n3-accent) absolute top-[30%] left-[22%] h-[44%] w-[56%] cursor-default rounded-[3rem] focus-visible:outline-2 focus-visible:outline-offset-4'
+            />
           </div>
-
-          {/* A quiet invitation under the core. Touch screens have no hover, so they are told to tap. */}
-          <m.p
-            aria-hidden
-            style={{ opacity: hintOpacity }}
-            className='text-(color:--color-n3-grey) pointer-events-none absolute top-[84%] left-1/2 m-0 flex -translate-x-1/2 items-center gap-1.5 text-[12.5px] whitespace-nowrap'
-          >
-            <MousePointer2 className='text-(color:--color-n3-accent) size-3.5' strokeWidth={1.8} />
-            <span className='[@media(hover:none)]:hidden'>Hover to see the packet path</span>
-            <span className='hidden [@media(hover:none)]:inline'>Tap to see the packet path</span>
-          </m.p>
-
-          <button
-            type='button'
-            aria-expanded={open}
-            aria-label='Show how the router moves a packet'
-            onPointerDown={handleCorePointerDown}
-            onPointerEnter={handleCorePointerEnter}
-            onClick={handleCoreClick}
-            onBlur={handleCoreBlur}
-            className='focus-visible:outline-(color:--color-n3-accent) absolute top-[30%] left-[22%] h-[44%] w-[56%] cursor-default rounded-[3rem] focus-visible:outline-2 focus-visible:outline-offset-4'
-          />
-        </div>
+        )}
         <StageList reduce={reduce} />
       </>
     </LazyMotion>
