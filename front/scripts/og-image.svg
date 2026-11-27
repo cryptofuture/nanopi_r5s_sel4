@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" font-family="DejaVu Sans, sans-serif">
+  <!-- Source for public/og.png (rendered with rsvg-convert, see scripts/build-og-image.sh) -->
+  <rect width="1200" height="630" fill="#eaeefc" />
+  <rect width="1200" height="10" fill="#16211e" />
+
+  <!-- router mark, same glyph as favicon -->
+  <g transform="translate(80 72) scale(4)" fill="none" stroke="#16211e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <rect width="20" height="8" x="2" y="14" rx="2" />
+    <path d="M6.01 18H6" />
+    <path d="M10.01 18H10" />
+    <path d="M15 10v4" />
+    <path d="M17.84 7.17a4 4 0 0 0-5.66 0" />
+    <path d="M20.66 4.34a8 8 0 0 0-11.31 0" />
+  </g>
+
+  <text x="80" y="300" font-size="66" font-weight="bold" fill="#16211e">seL4 router on NanoPi R5S</text>
+  <text x="80" y="366" font-size="30" fill="#5c6b64">DHCP WAN &#183; two routed RTL8125 LANs &#183; endpoint-preserving NAPT</text>
+  <text x="80" y="412" font-size="30" fill="#5c6b64">Firmware boots from the SD card.</text>
+
+  <line x1="80" y1="500" x2="1120" y2="500" stroke="#c6cfc9" stroke-width="2" />
+  <text x="80" y="562" font-size="28" font-weight="bold" fill="#16211e">sel4.hda.me</text>
+  <text x="1120" y="562" font-size="28" fill="#5c6b64" text-anchor="end">~440 Mbps down &#183; ~385 Mbps up</text>
+</svg>

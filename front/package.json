@@ -7,7 +7,7 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && vite build --ssr src/entry-server.jsx --outDir dist && node scripts/prerender.mjs",
     "preview": "vite preview",
     "lint": "standard"
   },
@@ -15,7 +15,8 @@
     "cn": "^0.5.2",
     "lucide-react": "^1.82.0",
     "motion": "^14.14.0",
-    "preact": "^11.2.0"
+    "preact": "^11.2.0",
+    "preact-render-to-string": "^6.8.3"
   },
   "devDependencies": {
     "@preact/preset-vite": "^2.10.6",

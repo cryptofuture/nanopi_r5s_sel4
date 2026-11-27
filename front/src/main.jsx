@@ -1,16 +1,5 @@
-import { render } from 'preact'
-import CoreHero from '@/components/ui/syntra-hero'
-import { Download, Flash, Architecture, Performance } from '@/components/sections'
+import { hydrate } from 'preact'
+import { App } from '@/App'
 import './index.css'
 
-const App = () => (
-  <>
-    <CoreHero />
-    <Download />
-    <Flash />
-    <Architecture />
-    <Performance />
-  </>
-)
-
-render(<App />, document.getElementById('app'))
+hydrate(<App />, document.getElementById('app'))
